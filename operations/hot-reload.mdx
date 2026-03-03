@@ -1,0 +1,366 @@
+---
+title: 'Hot Configuration Reload'
+description: 'Reload configuration without downtime using SIGHUP signal'
+---
+
+## Overview
+
+The Sol RPC Router supports hot configuration reloading via the `SIGHUP` signal. This allows you to update backend configurations, routing rules, and health check settings without restarting the server or dropping active connections.
+
+## How It Works
+
+The router registers a SIGHUP signal handler on startup that:
+
+1. Receives the SIGHUP signal
+2. Reloads the configuration file from disk
+3. Validates the new configuration
+4. Preserves health status for existing backends
+5. Atomically swaps the router state
+6. Continues serving requests without interruption
+
+### Implementation Details
+
+From `src/main.rs:127-191`:
+
+```rust
+// Spawn SIGHUP handler for hot reload
+let reload_state = router_state.clone();
+let config_path = args.config.clone();
+let persistent_health_state = health_state.clone();
+
+tokio::spawn(async move {
+    let mut sighup = signal(SignalKind::hangup())
+        .expect("Failed to register SIGHUP handler");
+    
+    loop {
+        sighup.recv().await;
+        info!("Received SIGHUP, reloading configuration from {}", config_path);
+
+        match load_config(&config_path) {
+            Ok(new_config) => {
+                info!("Configuration reloaded successfully");
+                info!("New backend count: {}", new_config.backends.len());
+                
+                // Preserve health status if backend label matches
+                let new_runtime_backends: Vec<RuntimeBackend> = new_config
+                    .backends
+                    .iter()
+                    .map(|b| {
+                        let is_healthy = if let Some(status) = 
+                            persistent_health_state.get_status(&b.label) {
+                            status.healthy
+                        } else {
+                            true // Default new backends to healthy
+                        };
+
+                        RuntimeBackend {
+                            config: b.clone(),
+                            healthy: Arc::new(AtomicBool::new(is_healthy)),
+                        }
+                    })
+                    .collect();
+                
+                // Atomically swap the state
+                reload_state.store(Arc::new(new_router_state));
+                info!("Router state atomically swapped");
+            }
+            Err(e) => {
+                error!("Failed to reload configuration: {}", e);
+            }
+        }
+    }
+});
+```
+
+## Triggering a Reload
+
+### Find the Process ID
+
+```bash
+# Using ps
+ps aux | grep sol-rpc-router
+
+# Using pidof
+pidof sol-rpc-router
+
+# Using systemd
+systemctl status sol-rpc-router
+```
+
+### Send SIGHUP Signal
+
+```bash
+# Using kill command
+kill -SIGHUP <pid>
+
+# Using killall
+killall -SIGHUP sol-rpc-router
+
+# Using systemd
+systemctl reload sol-rpc-router
+```
+
+## What Can Be Reloaded
+
+The following configuration changes take effect immediately:
+
+### Backend Configuration
+
+- **Add new backends**: Automatically start with healthy status
+- **Remove backends**: Gracefully excluded from routing
+- **Update backend URLs**: New requests use updated endpoints
+- **Change backend weights**: Load balancing adjusts immediately
+- **Modify WebSocket URLs**: New WS connections use updated URLs
+
+### Routing Rules
+
+- **Method routes**: Update which backends handle specific RPC methods
+- **Add/remove method overrides**: Route changes apply to new requests
+
+### Health Check Configuration
+
+- **Interval**: Change health check frequency
+- **Timeout**: Adjust health check timeout
+- **Method**: Switch health check RPC method
+- **Thresholds**: Update failure/success thresholds
+- **Slot lag**: Modify maximum allowed slot lag
+
+### Proxy Settings
+
+- **Timeout**: Update upstream request timeout
+
+## What Cannot Be Reloaded
+
+These settings require a full restart:
+
+- **Server ports** (HTTP, WebSocket, Metrics)
+- **Redis URL**
+- **Prometheus histogram buckets**
+
+## Health Status Preservation
+
+The reload mechanism preserves backend health state across configuration changes:
+
+### Existing Backends
+
+If a backend's label exists in both old and new configurations:
+- **Health status preserved**: Unhealthy backends remain unhealthy
+- **Consecutive counters preserved**: Failure/success counts maintained
+- **Last error preserved**: Error messages retained
+
+This prevents unhealthy backends from suddenly becoming healthy during reload.
+
+### New Backends
+
+Backends added during reload:
+- Start with **healthy** status (optimistic)
+- Begin health checks immediately
+- Follow normal failure threshold logic
+
+### Removed Backends
+
+Backends removed from configuration:
+- Health status retained in memory (for potential re-addition)
+- Immediately excluded from routing
+- Stop receiving health checks
+
+## Log Output
+
+### Successful Reload
+
+```
+Received SIGHUP, reloading configuration from config.toml
+Configuration reloaded successfully
+New backend count: 3
+Updated method routing overrides:
+  - getSlot -> mainnet-primary
+  - getBlockHeight -> mainnet-primary
+Router state atomically swapped
+```
+
+### Failed Reload
+
+If the new configuration is invalid, the old configuration remains active:
+
+```
+Received SIGHUP, reloading configuration from config.toml
+Failed to reload configuration: Backend weight must be greater than 0
+```
+
+Common validation errors:
+- Invalid TOML syntax
+- Missing required fields
+- Invalid backend weights (must be > 0)
+- Method routes referencing non-existent backends
+- Empty Redis URL
+
+## Active Connection Behavior
+
+### HTTP Requests
+
+- **In-flight requests**: Complete with old backend selection
+- **New requests**: Use new configuration immediately after swap
+
+### WebSocket Connections
+
+- **Active connections**: Remain open to original backend
+- **New connections**: Use newly configured backends
+
+There is **no disruption** to existing connections during reload.
+
+## Best Practices
+
+### 1. Validate Configuration Before Reload
+
+```bash
+# Test configuration syntax
+cargo run -- --config config.toml --dry-run  # if implemented
+
+# Or use a validation script
+toml-lint config.toml
+```
+
+### 2. Monitor Reload Success
+
+Watch logs when reloading:
+
+```bash
+# Trigger reload and watch logs
+kill -SIGHUP $(pidof sol-rpc-router) && journalctl -u sol-rpc-router -f
+```
+
+### 3. Incremental Changes
+
+Make one type of change at a time:
+- Add backends first, then adjust weights
+- Update method routes separately from health check settings
+- Test each change before combining
+
+### 4. Backup Configuration
+
+Before making changes:
+
+```bash
+cp config.toml config.toml.backup.$(date +%Y%m%d_%H%M%S)
+```
+
+### 5. Use Version Control
+
+Track configuration changes with git:
+
+```bash
+git add config.toml
+git commit -m "Add new backend: mainnet-tertiary"
+```
+
+## Automation Examples
+
+### Systemd Reload
+
+Enable reload support in systemd service:
+
+```ini
+[Service]
+ExecReload=/bin/kill -SIGHUP $MAINPID
+```
+
+Reload with:
+
+```bash
+sudo systemctl reload sol-rpc-router
+```
+
+### Kubernetes ConfigMap
+
+Automate reloads when ConfigMap changes:
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rpc-router-config
+data:
+  config.toml: |
+    port = 28899
+    # ... configuration ...
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sol-rpc-router
+spec:
+  template:
+    metadata:
+      annotations:
+        # Force pod restart on config change
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      containers:
+      - name: router
+        image: sol-rpc-router:latest
+        volumeMounts:
+        - name: config
+          mountPath: /etc/config.toml
+          subPath: config.toml
+      volumes:
+      - name: config
+        configMap:
+          name: rpc-router-config
+```
+
+Or use a sidecar to send SIGHUP when ConfigMap updates.
+
+### Configuration Management
+
+Ansible playbook example:
+
+```yaml
+- name: Update RPC router configuration
+  hosts: rpc_routers
+  tasks:
+    - name: Copy new configuration
+      copy:
+        src: config.toml
+        dest: /etc/sol-rpc-router/config.toml
+        backup: yes
+      notify: Reload RPC router
+
+  handlers:
+    - name: Reload RPC router
+      systemd:
+        name: sol-rpc-router
+        state: reloaded
+```
+
+## Troubleshooting
+
+### Reload Not Taking Effect
+
+**Symptom**: Configuration changes don't apply after SIGHUP
+
+**Solutions**:
+1. Check logs for validation errors
+2. Verify correct config file path
+3. Ensure process has permission to read config file
+4. Confirm signal reached the process: `kill -0 <pid>`
+
+### Old Backends Still Receiving Traffic
+
+**Symptom**: Removed backends continue getting requests
+
+**Cause**: Active WebSocket connections to old backends
+
+**Solution**: Wait for connections to naturally close, or restart if immediate change needed
+
+### Health Status Lost
+
+**Symptom**: Previously unhealthy backend becomes healthy after reload
+
+**Cause**: Backend label changed (treated as new backend)
+
+**Solution**: Keep backend labels consistent across reloads
+
+## Next Steps
+
+- [Monitor reload success](/operations/monitoring) with Prometheus metrics
+- [Troubleshoot configuration issues](/operations/troubleshooting)

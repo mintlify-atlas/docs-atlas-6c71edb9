@@ -1,0 +1,397 @@
+---
+title: Installation
+description: Detailed installation guide for Sol RPC Router including prerequisites, dependencies, and build instructions
+---
+
+## Prerequisites
+
+Before installing Sol RPC Router, ensure you have the following dependencies installed:
+
+### Rust (Required)
+
+Sol RPC Router requires **Rust 2021 edition** or later.
+
+<CodeGroup>
+```bash Linux / macOS
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+```bash Windows
+# Download and run rustup-init.exe from:
+# https://rustup.rs/
+```
+</CodeGroup>
+
+Verify your Rust installation:
+
+```bash
+rustc --version
+# Should show: rustc 1.70.0 (or higher)
+
+cargo --version
+# Should show: cargo 1.70.0 (or higher)
+```
+
+<Tip>
+  If you already have Rust installed, update to the latest stable version:
+  ```bash
+  rustup update stable
+  ```
+</Tip>
+
+### Redis (Required)
+
+Redis is required for API key storage and atomic rate limiting.
+
+<Tabs>
+  <Tab title="Docker">
+    The easiest way to run Redis:
+
+    ```bash
+    docker run -d \
+      --name sol-rpc-redis \
+      -p 6379:6379 \
+      redis:7-alpine
+    ```
+
+    To persist data across restarts:
+
+    ```bash
+    docker run -d \
+      --name sol-rpc-redis \
+      -p 6379:6379 \
+      -v redis-data:/data \
+      redis:7-alpine redis-server --appendonly yes
+    ```
+  </Tab>
+
+  <Tab title="Ubuntu / Debian">
+    ```bash
+    sudo apt update
+    sudo apt install redis-server
+    sudo systemctl start redis-server
+    sudo systemctl enable redis-server
+    ```
+
+    Verify installation:
+    ```bash
+    redis-cli ping
+    # Should return: PONG
+    ```
+  </Tab>
+
+  <Tab title="macOS">
+    Using Homebrew:
+
+    ```bash
+    brew install redis
+    brew services start redis
+    ```
+
+    Verify installation:
+    ```bash
+    redis-cli ping
+    # Should return: PONG
+    ```
+  </Tab>
+
+  <Tab title="From Source">
+    ```bash
+    wget https://download.redis.io/redis-stable.tar.gz
+    tar -xzvf redis-stable.tar.gz
+    cd redis-stable
+    make
+    make install
+    redis-server
+    ```
+  </Tab>
+</Tabs>
+
+<Info>
+  **Production Redis Setup**: For production deployments, configure Redis with persistence, authentication, and resource limits. See the [Redis production checklist](https://redis.io/docs/management/admin/) for details.
+</Info>
+
+## Building from Source
+
+<Steps>
+  <Step title="Clone the Repository">
+    ```bash
+    git clone https://github.com/glamsystems/sol-rpc-router
+    cd sol-rpc-router
+    ```
+  </Step>
+
+  <Step title="Build the Project">
+    Build the release version (optimized for production):
+
+    ```bash
+    cargo build --release
+    ```
+
+    This will compile:
+    - `sol-rpc-router` - The main proxy server
+    - `rpc-admin` - The API key management CLI
+
+    <Note>
+      **Build Time**: The first build may take 5-10 minutes as Cargo downloads and compiles all dependencies. Subsequent builds will be much faster.
+    </Note>
+
+    For development (faster compilation, no optimizations):
+
+    ```bash
+    cargo build
+    ```
+  </Step>
+
+  <Step title="Verify the Build">
+    Check that both binaries were created:
+
+    ```bash
+    ls -lh target/release/sol-rpc-router
+    ls -lh target/release/rpc-admin
+    ```
+
+    Run the version check:
+
+    ```bash
+    ./target/release/sol-rpc-router --help
+    ./target/release/rpc-admin --help
+    ```
+  </Step>
+
+  <Step title="Optional: Install System-Wide">
+    Install the binaries to your system PATH:
+
+    ```bash
+    cargo install --path .
+    ```
+
+    This installs to `~/.cargo/bin/` which should be in your PATH. Now you can run:
+
+    ```bash
+    sol-rpc-router --config config.toml
+    rpc-admin create my-client --rate-limit 50
+    ```
+  </Step>
+</Steps>
+
+## Dependencies
+
+Sol RPC Router uses the following key dependencies (automatically managed by Cargo):
+
+### Core Runtime
+
+| Dependency | Version | Purpose |
+|------------|---------|----------|
+| `tokio` | 1.x | Async runtime with full features |
+| `axum` | 0.7 | Web framework with WebSocket support |
+| `hyper` | 1.x | HTTP client and server |
+| `hyper-tls` | 0.6 | TLS support for HTTPS backends |
+
+### Data & Serialization
+
+| Dependency | Version | Purpose |
+|------------|---------|----------|
+| `serde` | 1.x | Serialization framework |
+| `serde_json` | 1.x | JSON parsing and generation |
+| `toml` | 0.8 | Configuration file parsing |
+
+### Redis & Caching
+
+| Dependency | Version | Purpose |
+|------------|---------|----------|
+| `redis` | 0.27 | Redis client with async support |
+| `moka` | 0.12 | Local API key cache (60s TTL) |
+
+### WebSocket
+
+| Dependency | Version | Purpose |
+|------------|---------|----------|
+| `tokio-tungstenite` | 0.24 | WebSocket client and server |
+| `futures-util` | 0.3 | Stream utilities for WebSocket |
+
+### Monitoring
+
+| Dependency | Version | Purpose |
+|------------|---------|----------|
+| `metrics` | 0.24 | Metrics collection framework |
+| `metrics-exporter-prometheus` | 0.16 | Prometheus metrics exporter |
+
+### Utilities
+
+| Dependency | Version | Purpose |
+|------------|---------|----------|
+| `clap` | 4.x | Command-line argument parsing |
+| `tracing` | 0.1 | Structured logging |
+| `rand` | 0.8 | Random API key generation |
+| `arc-swap` | 1.8 | Lock-free config reloading |
+
+<Note>
+  All dependencies are specified in `Cargo.toml` and are automatically downloaded and compiled by `cargo build`.
+</Note>
+
+## Configuration Files
+
+Create your configuration file based on the example:
+
+```bash
+cp config.example.toml config.toml
+```
+
+See the [Configuration Guide](/configuration/overview) for detailed documentation of all configuration options.
+
+## Running Tests
+
+Sol RPC Router includes 35+ unit and integration tests. All tests use mocks only—no Redis or real HTTP backends required.
+
+```bash
+# Run all tests
+cargo test
+
+# Run tests with output
+cargo test -- --nocapture
+
+# List all test names
+cargo test -- --list
+
+# Run a specific test
+cargo test test_load_config
+```
+
+Expected output:
+```
+running 35 tests
+test config::tests::test_load_config ... ok
+test handlers::tests::test_auth_cache ... ok
+test health::tests::test_health_state ... ok
+...
+test result: ok. 35 passed; 0 failed; 0 ignored
+```
+
+## System Requirements
+
+### Minimum Requirements
+
+- **CPU**: 1 core (2+ recommended)
+- **RAM**: 512 MB (1 GB+ recommended for production)
+- **Disk**: 100 MB for binaries + space for logs
+- **OS**: Linux, macOS, or Windows with WSL2
+
+### Recommended Production Setup
+
+- **CPU**: 4+ cores
+- **RAM**: 4 GB+ (depends on API key cache size and request volume)
+- **Disk**: SSD for Redis persistence
+- **Network**: Low-latency connection to Solana RPC backends
+- **OS**: Linux (Ubuntu 22.04 LTS or similar)
+
+<Warning>
+  **Redis Memory**: The API key cache uses approximately 1 KB per cached key. With 10,000 active keys, expect ~10 MB of RAM for the cache plus Redis overhead.
+</Warning>
+
+## Port Requirements
+
+Sol RPC Router uses three ports:
+
+| Port | Service | Configurable Via | Default |
+|------|---------|------------------|----------|
+| HTTP | JSON-RPC endpoint | `port` in config.toml | 28899 |
+| WebSocket | Dedicated WS endpoint | `port + 1` (automatic) | 28900 |
+| Metrics | Prometheus metrics | `metrics_port` in config.toml | 28901 |
+
+<Tip>
+  The WebSocket port is always HTTP port + 1 and cannot be configured separately. Ensure both ports are available.
+</Tip>
+
+## Environment Variables
+
+The `rpc-admin` CLI supports environment variables:
+
+```bash
+# Set default Redis URL
+export REDIS_URL="redis://127.0.0.1:6379/0"
+
+# Now you can omit --redis-url flag
+rpc-admin create my-client --rate-limit 50
+```
+
+The main router reads all configuration from `config.toml` and does not use environment variables.
+
+## Troubleshooting Build Issues
+
+<AccordionGroup>
+  <Accordion title="Linker errors on Linux">
+    **Error**: `linking with cc failed` or `cannot find -lssl`
+
+    **Solution**: Install development libraries:
+    ```bash
+    # Ubuntu/Debian
+    sudo apt install build-essential pkg-config libssl-dev
+
+    # RHEL/CentOS/Fedora
+    sudo yum install gcc openssl-devel
+    ```
+  </Accordion>
+
+  <Accordion title="Compilation errors with older Rust">
+    **Error**: `error[E0658]: use of unstable library feature`
+
+    **Solution**: Update Rust to the latest stable version:
+    ```bash
+    rustup update stable
+    rustup default stable
+    ```
+  </Accordion>
+
+  <Accordion title="Out of memory during compilation">
+    **Error**: `LLVM ERROR: out of memory` or system hangs
+
+    **Solution**: Reduce parallel compilation jobs:
+    ```bash
+    cargo build --release -j 2
+    ```
+
+    Or increase system swap space.
+  </Accordion>
+
+  <Accordion title="Redis connection issues">
+    **Error**: `Failed to initialize Redis KeyStore`
+
+    **Solutions**:
+    - Verify Redis is running: `redis-cli ping`
+    - Check Redis is listening: `netstat -tlnp | grep 6379`
+    - Test connection: `redis-cli -u redis://127.0.0.1:6379/0 ping`
+    - Check firewall rules
+    - Verify `redis_url` in config.toml is correct
+  </Accordion>
+
+  <Accordion title="Permission denied on port binding">
+    **Error**: `Permission denied (os error 13)` when starting router
+
+    **Solution**: Ports below 1024 require root privileges. Either:
+    - Use ports above 1024 (recommended): `port = 8899`
+    - Run with sudo (not recommended for production)
+    - Use systemd socket activation
+    - Configure port forwarding with iptables
+  </Accordion>
+</AccordionGroup>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Quick Start" icon="rocket" href="/quickstart">
+    Get your router running in 5 minutes
+  </Card>
+  
+  <Card title="Configuration" icon="sliders" href="/configuration/overview">
+    Learn about all configuration options
+  </Card>
+  
+  <Card title="Deployment" icon="server" href="/operations/deployment">
+    Deploy to production
+  </Card>
+  
+  <Card title="Monitoring" icon="chart-line" href="/operations/monitoring">
+    Set up Prometheus and Grafana
+  </Card>
+</CardGroup>

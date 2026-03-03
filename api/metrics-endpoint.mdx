@@ -1,0 +1,279 @@
+---
+title: 'Metrics Endpoint'
+description: 'Prometheus metrics for monitoring RPC router performance'
+---
+
+## GET /metrics
+
+Exports Prometheus-compatible metrics for monitoring request rates, latencies, backend health, and WebSocket connections. This endpoint runs on a dedicated port (configured via `metrics_port` in `config.toml`) and does not require authentication.
+
+### Configuration
+
+```toml config.toml
+metrics_port = 9090  # Dedicated port for metrics endpoint
+```
+
+### Request
+
+No parameters required.
+
+```bash
+GET http://localhost:9090/metrics
+```
+
+### Response Format
+
+Returns metrics in Prometheus text-based exposition format:
+
+```
+# HELP metric_name Description of the metric
+# TYPE metric_name metric_type
+metric_name{label="value"} value timestamp
+```
+
+## Metrics Reference
+
+### HTTP Request Metrics
+
+<ResponseField name="rpc_requests_total" type="counter">
+  Total number of RPC requests processed.
+  
+  **Labels:**
+  - `method`: HTTP method (e.g., `POST`, `GET`)
+  - `status`: HTTP status code (e.g., `200`, `401`, `429`, `503`)
+  - `rpc_method`: Solana RPC method from request body (e.g., `getSlot`, `sendTransaction`, `unknown`)
+  - `backend`: Selected backend label (e.g., `mainnet-primary`, `none` if no backend selected)
+  - `owner`: API key owner from Redis (e.g., `my-client`, `none` if unauthenticated)
+</ResponseField>
+
+<ResponseField name="rpc_request_duration_seconds" type="histogram">
+  Request duration histogram with configurable buckets.
+  
+  **Labels:**
+  - `rpc_method`: Solana RPC method
+  - `backend`: Backend label
+  - `owner`: API key owner
+  
+  **Buckets:** `[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]`
+  
+  **Exported metrics:**
+  - `rpc_request_duration_seconds_bucket{le="0.1"}`: Count of requests ≤ 100ms
+  - `rpc_request_duration_seconds_sum`: Total duration of all requests
+  - `rpc_request_duration_seconds_count`: Total number of requests
+</ResponseField>
+
+### WebSocket Metrics
+
+<ResponseField name="ws_connections_total" type="counter">
+  Total WebSocket connection attempts.
+  
+  **Labels:**
+  - `backend`: Backend label (or `none`)
+  - `owner`: API key owner (or `none`)
+  - `status`: Connection status:
+    - `connected`: Successfully upgraded and connected to backend
+    - `auth_failed`: Invalid or missing API key
+    - `rate_limited`: API key exceeded rate limit
+    - `no_backend`: No healthy WebSocket backends available
+    - `backend_connect_failed`: Failed to connect to backend WebSocket
+    - `error`: Internal error during validation
+</ResponseField>
+
+<ResponseField name="ws_active_connections" type="gauge">
+  Currently active WebSocket connections.
+  
+  **Labels:**
+  - `backend`: Backend label
+  - `owner`: API key owner
+  
+  Incremented on successful upgrade, decremented on disconnect.
+</ResponseField>
+
+<ResponseField name="ws_messages_total" type="counter">
+  Total WebSocket messages relayed.
+  
+  **Labels:**
+  - `backend`: Backend label
+  - `owner`: API key owner
+  - `direction`: Message direction:
+    - `client_to_backend`: Client → Backend
+    - `backend_to_client`: Backend → Client
+</ResponseField>
+
+<ResponseField name="ws_connection_duration_seconds" type="histogram">
+  WebSocket connection duration (time from upgrade to disconnect).
+  
+  **Labels:**
+  - `backend`: Backend label
+  - `owner`: API key owner
+  
+  Uses the same histogram buckets as `rpc_request_duration_seconds`.
+</ResponseField>
+
+## Example Output
+
+```prometheus Metrics Sample
+# HELP rpc_requests_total Total RPC requests
+# TYPE rpc_requests_total counter
+rpc_requests_total{method="POST",status="200",rpc_method="getSlot",backend="mainnet-primary",owner="my-client"} 15234
+rpc_requests_total{method="POST",status="401",rpc_method="unknown",backend="none",owner="none"} 42
+rpc_requests_total{method="POST",status="429",rpc_method="sendTransaction",backend="none",owner="rate-limited-user"} 127
+
+# HELP rpc_request_duration_seconds RPC request duration
+# TYPE rpc_request_duration_seconds histogram
+rpc_request_duration_seconds_bucket{rpc_method="getSlot",backend="mainnet-primary",owner="my-client",le="0.01"} 1250
+rpc_request_duration_seconds_bucket{rpc_method="getSlot",backend="mainnet-primary",owner="my-client",le="0.05"} 4820
+rpc_request_duration_seconds_bucket{rpc_method="getSlot",backend="mainnet-primary",owner="my-client",le="0.1"} 6234
+rpc_request_duration_seconds_bucket{rpc_method="getSlot",backend="mainnet-primary",owner="my-client",le="+Inf"} 6500
+rpc_request_duration_seconds_sum{rpc_method="getSlot",backend="mainnet-primary",owner="my-client"} 245.3
+rpc_request_duration_seconds_count{rpc_method="getSlot",backend="mainnet-primary",owner="my-client"} 6500
+
+# HELP ws_connections_total WebSocket connections
+# TYPE ws_connections_total counter
+ws_connections_total{backend="mainnet-primary",owner="my-client",status="connected"} 82
+ws_connections_total{backend="none",owner="none",status="auth_failed"} 3
+
+# HELP ws_active_connections Active WebSocket connections
+# TYPE ws_active_connections gauge
+ws_active_connections{backend="mainnet-primary",owner="my-client"} 12
+ws_active_connections{backend="backup-rpc",owner="other-client"} 5
+
+# HELP ws_messages_total WebSocket messages relayed
+# TYPE ws_messages_total counter
+ws_messages_total{backend="mainnet-primary",owner="my-client",direction="client_to_backend"} 4821
+ws_messages_total{backend="mainnet-primary",owner="my-client",direction="backend_to_client"} 8932
+
+# HELP ws_connection_duration_seconds WebSocket connection duration
+# TYPE ws_connection_duration_seconds histogram
+ws_connection_duration_seconds_bucket{backend="mainnet-primary",owner="my-client",le="1.0"} 5
+ws_connection_duration_seconds_bucket{backend="mainnet-primary",owner="my-client",le="10.0"} 42
+ws_connection_duration_seconds_bucket{backend="mainnet-primary",owner="my-client",le="+Inf"} 82
+ws_connection_duration_seconds_sum{backend="mainnet-primary",owner="my-client"} 3245.7
+ws_connection_duration_seconds_count{backend="mainnet-primary",owner="my-client"} 82
+```
+
+## Grafana Queries
+
+### Request Rate by Method
+
+```promql
+sum(rate(rpc_requests_total[5m])) by (rpc_method)
+```
+
+### P95 Latency by Backend
+
+```promql
+histogram_quantile(0.95, 
+  sum(rate(rpc_request_duration_seconds_bucket[5m])) by (backend, le)
+)
+```
+
+### Error Rate
+
+```promql
+sum(rate(rpc_requests_total{status=~"5.."}[5m])) / 
+sum(rate(rpc_requests_total[5m]))
+```
+
+### Auth Failure Rate
+
+```promql
+sum(rate(rpc_requests_total{status="401"}[5m]))
+```
+
+### Rate Limit Hit Rate
+
+```promql
+sum(rate(rpc_requests_total{status="429"}[5m])) by (owner)
+```
+
+### Active WebSocket Connections
+
+```promql
+sum(ws_active_connections) by (backend)
+```
+
+### WebSocket Message Throughput
+
+```promql
+sum(rate(ws_messages_total[1m])) by (direction)
+```
+
+### Backend Request Distribution
+
+```promql
+sum(rate(rpc_requests_total{status="200"}[5m])) by (backend)
+```
+
+## Prometheus Configuration
+
+Add the router to your Prometheus scrape targets:
+
+```yaml prometheus.yml
+scrape_configs:
+  - job_name: 'rpc-router'
+    scrape_interval: 15s
+    static_configs:
+      - targets: ['localhost:9090']
+        labels:
+          service: 'sol-rpc-router'
+          environment: 'production'
+```
+
+## Alerting Rules
+
+```yaml alerts.yml
+groups:
+  - name: rpc_router
+    interval: 30s
+    rules:
+      - alert: HighErrorRate
+        expr: |
+          sum(rate(rpc_requests_total{status=~"5.."}[5m])) /
+          sum(rate(rpc_requests_total[5m])) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "RPC router error rate above 5%"
+      
+      - alert: HighLatency
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(rpc_request_duration_seconds_bucket[5m])) by (le)
+          ) > 2.0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "P95 latency above 2 seconds"
+      
+      - alert: RateLimitSpike
+        expr: |
+          sum(rate(rpc_requests_total{status="429"}[5m])) > 10
+        for: 5m
+        labels:
+          severity: info
+        annotations:
+          summary: "Rate limit rejections spiking"
+      
+      - alert: WebSocketConnectionFailures
+        expr: |
+          sum(rate(ws_connections_total{status!="connected"}[5m])) > 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "WebSocket connection failures elevated"
+```
+
+## Histogram Buckets
+
+The router uses carefully selected histogram buckets optimized for RPC latency patterns:
+
+- **Sub-10ms**: `[0.001, 0.005, 0.01]` - Fast cache hits, local requests
+- **10-100ms**: `[0.025, 0.05, 0.1]` - Typical RPC response times
+- **100ms-1s**: `[0.25, 0.5, 1.0]` - Slower methods, network variance
+- **1s+**: `[2.5, 5.0, 10.0]` - Timeouts, degraded backends
+
+These buckets enable accurate percentile calculations in Grafana using `histogram_quantile()`.

@@ -1,0 +1,254 @@
+---
+title: 'Backend Configuration'
+description: 'Configure RPC backends with weights, URLs, and WebSocket support'
+---
+
+## Overview
+
+Backends are the upstream Solana RPC nodes that the router forwards requests to. Each backend is defined with a unique label, URL, weight for load balancing, and optional WebSocket endpoint.
+
+## Backend Structure
+
+Backends are defined as an array in the TOML configuration using the `[[backends]]` notation:
+
+```toml
+[[backends]]
+label = "mainnet-primary"
+url = "https://api.mainnet-beta.solana.com"
+weight = 10
+ws_url = "wss://api.mainnet-beta.solana.com"
+
+[[backends]]
+label = "backup-rpc"
+url = "https://solana-api.com"
+weight = 5
+```
+
+## Configuration Parameters
+
+<ParamField path="label" type="string" required>
+  Unique identifier for the backend. Used in metrics, logs, and method routing.
+  
+  **Validation Rules**:
+  - Cannot be empty
+  - Must be unique across all backends
+  - Referenced by method routes (if configured)
+  
+  <Warning>
+    Duplicate labels will cause a validation error on startup: "Duplicate backend labels found in configuration"
+  </Warning>
+</ParamField>
+
+<ParamField path="url" type="string" required>
+  HTTP(S) endpoint for the RPC node.
+  
+  **Examples**:
+  - `https://api.mainnet-beta.solana.com`
+  - `https://solana-api.com`
+  - `http://127.0.0.1:9090` (local testing)
+  
+  <Note>
+    Both HTTP and HTTPS URLs are supported. Use HTTPS for production deployments.
+  </Note>
+</ParamField>
+
+<ParamField path="weight" type="integer" required>
+  Relative weight for weighted random load balancing. Higher weights receive more traffic.
+  
+  **Validation**: Must be greater than 0
+  
+  **Example**: A backend with `weight = 10` receives twice as much traffic as one with `weight = 5`
+  
+  <Warning>
+    Setting weight to 0 will cause validation error: "Backend '[label]' has invalid weight 0"
+  </Warning>
+</ParamField>
+
+<ParamField path="ws_url" type="string">
+  WebSocket endpoint for subscription-based RPC methods (optional).
+  
+  **Examples**:
+  - `wss://api.mainnet-beta.solana.com`
+  - `ws://127.0.0.1:9091` (local testing)
+  
+  <Note>
+    If omitted, WebSocket requests to this backend will not be supported. The router's main WebSocket endpoint runs on `port + 1`.
+  </Note>
+</ParamField>
+
+## Load Balancing Behavior
+
+The router uses **weighted random selection** to distribute requests across healthy backends:
+
+1. Only healthy backends (passing health checks) are eligible
+2. Each backend's probability is `weight / sum_of_all_healthy_weights`
+3. Selection is random but statistically matches the weight distribution
+
+### Example
+
+```toml
+[[backends]]
+label = "primary"
+url = "https://rpc1.example.com"
+weight = 10
+
+[[backends]]
+label = "secondary"
+url = "https://rpc2.example.com"
+weight = 5
+
+[[backends]]
+label = "tertiary"
+url = "https://rpc3.example.com"
+weight = 2
+```
+
+Traffic distribution:
+- **primary**: 10/(10+5+2) = ~59% of requests
+- **secondary**: 5/(10+5+2) = ~29% of requests
+- **tertiary**: 2/(10+5+2) = ~12% of requests
+
+<Note>
+  If a backend fails health checks, it's removed from the pool and traffic is redistributed among healthy backends.
+</Note>
+
+## WebSocket Configuration
+
+WebSocket support is optional per backend:
+
+```toml
+# Backend with WebSocket support
+[[backends]]
+label = "full-featured"
+url = "https://api.mainnet-beta.solana.com"
+weight = 10
+ws_url = "wss://api.mainnet-beta.solana.com"
+
+# Backend without WebSocket support
+[[backends]]
+label = "http-only"
+url = "https://another-rpc.com"
+weight = 5
+# ws_url omitted
+```
+
+<Warning>
+  If a WebSocket request is routed to a backend without `ws_url` configured, the connection will fail.
+</Warning>
+
+## Validation Rules
+
+All backends are validated on startup:
+
+<Check>At least one backend must be configured</Check>
+<Check>All labels must be unique (no duplicates)</Check>
+<Check>All labels must be non-empty strings</Check>
+<Check>All weights must be greater than 0</Check>
+<Check>All URLs must be valid (enforced by TOML parsing)</Check>
+
+Validation errors from `src/config.rs:63-122`:
+
+```
+"At least one backend must be configured"
+"Duplicate backend labels found in configuration"
+"Backend '[label]' has invalid weight 0"
+"Backend with URL '[url]' has empty label"
+```
+
+## Common Patterns
+
+### Single Backend (Simple Proxy)
+
+```toml
+[[backends]]
+label = "mainnet"
+url = "https://api.mainnet-beta.solana.com"
+weight = 1
+ws_url = "wss://api.mainnet-beta.solana.com"
+```
+
+### Primary + Backup
+
+```toml
+[[backends]]
+label = "primary"
+url = "https://primary-rpc.com"
+weight = 10
+ws_url = "wss://primary-rpc.com"
+
+[[backends]]
+label = "backup"
+url = "https://backup-rpc.com"
+weight = 1
+ws_url = "wss://backup-rpc.com"
+```
+
+This sends ~91% of traffic to primary and ~9% to backup.
+
+### Equal Distribution
+
+```toml
+[[backends]]
+label = "node-1"
+url = "https://rpc1.example.com"
+weight = 1
+
+[[backends]]
+label = "node-2"
+url = "https://rpc2.example.com"
+weight = 1
+
+[[backends]]
+label = "node-3"
+url = "https://rpc3.example.com"
+weight = 1
+```
+
+Each backend receives ~33% of traffic.
+
+### Local Testing
+
+```toml
+[[backends]]
+label = "mock"
+url = "http://127.0.0.1:9090"
+weight = 1
+```
+
+Minimal configuration for development (from `debug_config.toml:4-7`).
+
+## Integration with Method Routing
+
+Backend labels are referenced in method-based routing:
+
+```toml
+[[backends]]
+label = "fast-node"
+url = "https://fast-rpc.com"
+weight = 5
+
+[[backends]]
+label = "archive-node"
+url = "https://archive-rpc.com"
+weight = 5
+
+[method_routes]
+getSlot = "fast-node"              # Route getSlot to fast-node
+getAccountInfo = "archive-node"    # Route getAccountInfo to archive-node
+```
+
+<Warning>
+  Method routes must reference existing backend labels. Invalid references cause validation error: "Method route '[method]' references unknown backend label '[label]'"
+</Warning>
+
+See [Method Routing](/configuration/method-routing) for more details.
+
+## Monitoring
+
+Backend health and performance metrics are exposed via Prometheus:
+
+- `backend_health{label="[label]"}` - Current health status (1 = healthy, 0 = unhealthy)
+- `backend_requests_total{label="[label]"}` - Total requests sent to backend
+- `backend_errors_total{label="[label]"}` - Total errors from backend
+
+See [Metrics](/features/metrics) for complete list.

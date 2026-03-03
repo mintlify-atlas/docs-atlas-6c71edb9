@@ -1,0 +1,160 @@
+---
+title: 'Server CLI Options'
+description: 'Command-line arguments for the sol-rpc-router server'
+---
+
+The `sol-rpc-router` server binary accepts command-line arguments to configure its runtime behavior.
+
+## Usage
+
+```bash
+sol-rpc-router [OPTIONS]
+```
+
+## Options
+
+<ParamField path="--config" type="string" default="config.toml">
+  Path to the TOML configuration file.
+  
+  The configuration file defines backends, Redis connection, health check settings, and other router behavior. See [Configuration](/configuration) for full details.
+</ParamField>
+
+<ParamField path="-c" type="string">
+  Short alias for `--config`.
+</ParamField>
+
+## Examples
+
+### Default Configuration
+
+Run the server with the default `config.toml` in the current directory:
+
+```bash
+sol-rpc-router
+```
+
+### Custom Configuration Path
+
+Specify a custom configuration file:
+
+```bash
+sol-rpc-router --config /etc/sol-rpc-router/production.toml
+```
+
+Or using the short flag:
+
+```bash
+sol-rpc-router -c ~/configs/dev.toml
+```
+
+## Configuration File Format
+
+The TOML configuration file must include:
+
+- **Redis URL**: For API key storage and rate limiting
+- **Backends**: At least one upstream RPC endpoint
+- **Proxy settings**: Timeout configuration
+- **Health check settings**: Interval, thresholds, and probe method
+
+### Minimal Example
+
+```toml
+port = 28899
+redis_url = "redis://127.0.0.1:6379/0"
+metrics_port = 9090
+
+[[backends]]
+label = "mainnet-primary"
+url = "https://api.mainnet-beta.solana.com"
+weight = 10
+
+[proxy]
+timeout_secs = 30
+
+[health_check]
+interval_secs = 30
+timeout_secs = 5
+method = "getSlot"
+consecutive_failures_threshold = 3
+consecutive_successes_threshold = 2
+```
+
+See the [Configuration](/configuration) page for comprehensive documentation of all available options.
+
+## Hot Reload
+
+The router supports configuration hot-reloading via SIGHUP:
+
+```bash
+# Send SIGHUP to reload config.toml without restarting
+kill -HUP $(pgrep sol-rpc-router)
+```
+
+When SIGHUP is received:
+
+1. The configuration file specified by `--config` is re-read
+2. New backend list and settings are loaded
+3. Health status is preserved for backends that still exist (matched by label)
+4. Router state is atomically swapped to use the new configuration
+5. No downtime or connection interruption occurs
+
+### Example Log Output
+
+```bash
+Received SIGHUP, reloading configuration from config.toml
+Configuration reloaded successfully
+New backend count: 3
+Updated method routing overrides:
+  - getSlot -> mainnet-primary
+Router state atomically swapped
+```
+
+## Server Startup
+
+On startup, the server:
+
+1. Parses command-line arguments
+2. Loads the configuration file from `--config` path
+3. Validates the configuration (see [Config Validation](/configuration#validation))
+4. Connects to Redis using the configured `redis_url`
+5. Initializes all backends as healthy
+6. Spawns the health check background loop
+7. Spawns the SIGHUP reload handler
+8. Starts three servers:
+   - **HTTP server** on `port` (JSON-RPC + WebSocket upgrade)
+   - **WebSocket server** on `port + 1` (dedicated WebSocket port)
+   - **Metrics server** on `metrics_port` (Prometheus `/metrics` endpoint)
+
+### Example Startup Log
+
+```bash
+Loaded configuration from: config.toml
+Redis URL configured (host redacted)
+Loaded 2 backends
+  - [mainnet-primary] https://api.mainnet-beta.solana.com (weight: 10)
+  - [backup-rpc] https://solana-api.com (weight: 5)
+Method routing overrides:
+  - getSlot -> mainnet-primary
+Starting health check loop
+HTTP server listening on http://0.0.0.0:28899
+WebSocket server listening on ws://0.0.0.0:28900
+Metrics server listening on http://0.0.0.0:9090
+Health monitoring endpoint: http://0.0.0.0:28899/health
+```
+
+## Exit Codes
+
+The server exits with non-zero status codes on critical failures:
+
+| Code | Reason |
+|------|--------|
+| `0` | Clean shutdown |
+| `1` | Redis connection failure |
+| `1` | Configuration load/validation error |
+| `1` | Server binding error (port already in use) |
+
+## Environment Variables
+
+The server itself does not read environment variables directly. However, the configuration file loaded via `--config` can reference environment variables in downstream tools (e.g., Redis connection pooling, TLS certificates).
+
+For API key management, the `rpc-admin` CLI supports the `REDIS_URL` environment variable. See [rpc-admin CLI](/api/rpc-admin) for details.

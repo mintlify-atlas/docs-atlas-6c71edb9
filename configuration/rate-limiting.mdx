@@ -1,0 +1,284 @@
+---
+title: 'Rate Limiting'
+description: 'Configure per-API-key rate limits using Redis'
+---
+
+## Overview
+
+Sol RPC Router implements Redis-backed rate limiting to control request throughput per API key. Rate limits are enforced before requests reach backend nodes, protecting your infrastructure from abuse.
+
+## Redis Configuration
+
+Rate limiting requires a Redis instance. Configure the connection in your `config.toml`:
+
+<ParamField path="redis_url" type="string" required>
+  Redis connection URL for rate limiting state storage.
+  
+  **Format**: `redis://[host]:[port]/[database]`
+  
+  **Examples**:
+  - `redis://127.0.0.1:6379/0` - Local Redis, database 0
+  - `redis://localhost:6379` - Local Redis, default database
+  - `redis://redis.example.com:6379/1` - Remote Redis, database 1
+  
+  <Warning>
+    Cannot be empty. Validation error if omitted: "Redis URL must be configured" (from `src/config.rs:71-73`)
+  </Warning>
+</ParamField>
+
+## How Rate Limiting Works
+
+1. **API Key Extraction**: Each request must include an API key (typically via header or query parameter)
+2. **Redis Lookup**: Router checks current request count for the API key in Redis
+3. **Limit Enforcement**: If limit exceeded, request is rejected with HTTP 429
+4. **Request Forwarding**: If within limits, request is forwarded to backend
+5. **Counter Update**: Redis counter is incremented with TTL for sliding window
+
+## API Key Authentication
+
+Requests must include an API key for rate limiting to work. Common patterns:
+
+### Header-Based (Recommended)
+
+```bash
+curl -X POST http://localhost:28899 \
+  -H "X-API-Key: your-api-key-here" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"getSlot"}'
+```
+
+### Query Parameter
+
+```bash
+curl -X POST "http://localhost:28899?api_key=your-api-key-here" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"getSlot"}'
+```
+
+<Note>
+  The exact API key extraction method depends on your router implementation. Check your authentication middleware configuration.
+</Note>
+
+## Configuring Rate Limits
+
+Rate limits are typically configured per API key in Redis or through an admin API. The configuration system in `src/config.rs` ensures Redis connectivity, but limit values are managed at runtime.
+
+### Redis Key Structure
+
+Rate limit counters are stored in Redis with keys like:
+
+```
+ratelimit:[api_key]:[time_window]
+```
+
+Example:
+```
+ratelimit:abc123:1710892800  # Requests from API key "abc123" in current window
+```
+
+### Setting Limits via Redis CLI
+
+You can manually configure limits using Redis:
+
+```bash
+# Set limit for API key "abc123" to 1000 requests per minute
+redis-cli SET ratelimit:config:abc123 1000
+
+# Set TTL for cleanup
+redis-cli EXPIRE ratelimit:config:abc123 86400  # 24 hours
+```
+
+## Rate Limit Response
+
+When a rate limit is exceeded, the router returns:
+
+**HTTP Status**: `429 Too Many Requests`
+
+**Response Body**:
+```json
+{
+  "error": "Rate limit exceeded",
+  "retry_after": 60
+}
+```
+
+**Headers**:
+```
+X-RateLimit-Limit: 1000
+X-RateLimit-Remaining: 0
+X-RateLimit-Reset: 1710892860
+Retry-After: 60
+```
+
+<Note>
+  Exact response format may vary based on your implementation. Check your middleware configuration.
+</Note>
+
+## Monitoring Rate Limits
+
+Rate limiting metrics are exposed via Prometheus:
+
+```
+rate_limit_exceeded_total{api_key="abc123"} 42
+rate_limit_requests_total{api_key="abc123"} 1500
+redis_connection_errors_total 0
+```
+
+Query current limits:
+
+```bash
+curl http://localhost:28901/metrics | grep rate_limit
+```
+
+## Common Patterns
+
+### Development Environment
+
+```toml
+port = 8081
+metrics_port = 8082
+redis_url = "redis://127.0.0.1:6379"
+
+[[backends]]
+label = "mock"
+url = "http://127.0.0.1:9090"
+weight = 1
+```
+
+Local Redis for testing (from `debug_config.toml:1-7`).
+
+### Production Environment
+
+```toml
+port = 28899
+metrics_port = 28901
+redis_url = "redis://redis.internal:6379/0"
+
+[[backends]]
+label = "mainnet-primary"
+url = "https://api.mainnet-beta.solana.com"
+weight = 10
+```
+
+Dedicated Redis instance with database separation.
+
+### High Availability Redis
+
+```toml
+redis_url = "redis://redis-cluster.example.com:6379/0"
+```
+
+<Note>
+  For Redis Cluster or Sentinel setups, ensure your connection string matches your Redis configuration. The router uses the standard Redis client which supports various deployment modes.
+</Note>
+
+## Redis Connection Requirements
+
+<Check>Redis must be running and accessible before starting the router</Check>
+<Check>Redis URL must be non-empty (validated at startup)</Check>
+<Check>Network connectivity to Redis host required</Check>
+<Check>Appropriate Redis permissions for GET/SET/EXPIRE operations</Check>
+
+### Connection Failures
+
+If Redis is unavailable:
+
+- **Startup**: Router may exit if Redis connection is critical
+- **Runtime**: Requests may be rejected or allowed through (depending on fail-open/fail-closed configuration)
+- **Metrics**: `redis_connection_errors_total` counter incremented
+
+<Warning>
+  Always monitor Redis connectivity. Rate limiting failures can either block all traffic (fail-closed) or allow unlimited traffic (fail-open), depending on your configuration.
+</Warning>
+
+## Best Practices
+
+<Card title="Use Redis persistence" icon="database">
+  Enable AOF or RDB snapshots to prevent losing rate limit state during Redis restarts.
+</Card>
+
+<Card title="Set appropriate TTLs" icon="clock">
+  Configure Redis key expiration to automatically clean up old counters and prevent unbounded memory growth.
+</Card>
+
+<Card title="Monitor Redis performance" icon="chart-line">
+  Track Redis latency and memory usage. Slow Redis operations will impact request latency.
+</Card>
+
+<Card title="Use dedicated Redis database" icon="layer-group">
+  Separate rate limiting state from other application data using different database numbers (e.g., `/0`, `/1`).
+</Card>
+
+<Card title="Plan for Redis failures" icon="shield">
+  Decide whether to fail-open (allow requests) or fail-closed (reject requests) when Redis is unavailable.
+</Card>
+
+<Card title="Secure Redis access" icon="lock">
+  Use Redis AUTH, TLS encryption, and network isolation in production environments.
+</Card>
+
+## Troubleshooting
+
+### All Requests Return 429
+
+**Symptoms**: All requests rate limited regardless of API key
+
+**Solutions**:
+- Check Redis counter values: `redis-cli KEYS 'ratelimit:*'`
+- Verify correct API key extraction
+- Check if limits are set too low
+- Clear Redis counters: `redis-cli FLUSHDB` (development only)
+
+### Rate Limiting Not Working
+
+**Symptoms**: No rate limits enforced, all requests pass through
+
+**Solutions**:
+- Verify `redis_url` is configured correctly
+- Check Redis connectivity: `redis-cli -u redis://127.0.0.1:6379/0 PING`
+- Ensure API keys are being sent with requests
+- Check metrics for `redis_connection_errors_total`
+
+### Redis Connection Errors
+
+**Symptoms**: Logs show Redis connection failures
+
+**Solutions**:
+- Verify Redis is running: `redis-cli PING`
+- Check network connectivity to Redis host
+- Verify `redis_url` format and credentials
+- Check firewall rules and security groups
+
+## Configuration Example
+
+Complete example with Redis rate limiting:
+
+```toml
+port = 28899
+metrics_port = 28901
+redis_url = "redis://127.0.0.1:6379/0"
+
+[[backends]]
+label = "mainnet-primary"
+url = "https://api.mainnet-beta.solana.com"
+weight = 10
+ws_url = "wss://api.mainnet-beta.solana.com"
+
+[[backends]]
+label = "backup-rpc"
+url = "https://solana-api.com"
+weight = 5
+
+[proxy]
+timeout_secs = 30
+
+[health_check]
+interval_secs = 30
+timeout_secs = 5
+method = "getSlot"
+consecutive_failures_threshold = 3
+consecutive_successes_threshold = 2
+max_slot_lag = 50
+```
+
+From `config.example.toml:1-25`.

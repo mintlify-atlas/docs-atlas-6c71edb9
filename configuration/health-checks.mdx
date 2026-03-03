@@ -1,0 +1,265 @@
+---
+title: 'Health Check Configuration'
+description: 'Configure automatic health monitoring and thresholds for backend nodes'
+---
+
+## Overview
+
+Sol RPC Router continuously monitors backend health by sending periodic RPC requests. Unhealthy backends are automatically removed from the load balancing pool until they recover.
+
+## Configuration
+
+Health checks are configured in the `[health_check]` section:
+
+```toml
+[health_check]
+interval_secs = 30
+timeout_secs = 5
+method = "getSlot"
+consecutive_failures_threshold = 3
+consecutive_successes_threshold = 2
+max_slot_lag = 50
+```
+
+<Note>
+  The entire `[health_check]` section is optional. If omitted, default values are used.
+</Note>
+
+## Parameters
+
+<ParamField path="interval_secs" type="integer" default="30">
+  Time in seconds between health check probes for each backend.
+  
+  **Default**: 30 seconds (from `src/config.rs:45`)
+  
+  **Recommendation**: Set based on your tolerance for downtime detection. Shorter intervals detect failures faster but increase overhead.
+</ParamField>
+
+<ParamField path="timeout_secs" type="integer" default="5">
+  Maximum time in seconds to wait for a health check response before considering it failed.
+  
+  **Default**: 5 seconds (from `src/config.rs:46`)
+  
+  <Warning>
+    Should be significantly less than `interval_secs` to avoid overlapping checks.
+  </Warning>
+</ParamField>
+
+<ParamField path="method" type="string" default="getSlot">
+  RPC method to use for health check probes.
+  
+  **Default**: `"getSlot"` (from `src/config.rs:47`)
+  
+  **Common options**:
+  - `getSlot` - Fast, lightweight check
+  - `getHealth` - Explicit health endpoint (if supported)
+  - `getVersion` - Version information check
+  
+  <Note>
+    Choose a method that's fast and doesn't require parameters. `getSlot` is recommended for most use cases.
+  </Note>
+</ParamField>
+
+<ParamField path="consecutive_failures_threshold" type="integer" default="3">
+  Number of consecutive failed health checks before marking a backend as unhealthy.
+  
+  **Default**: 3 (from `src/config.rs:48`)
+  
+  **Purpose**: Prevents transient failures from removing backends from the pool.
+  
+  **Example**: With default settings, a backend must fail 3 checks in a row (90+ seconds) before being marked unhealthy.
+</ParamField>
+
+<ParamField path="consecutive_successes_threshold" type="integer" default="2">
+  Number of consecutive successful health checks before marking an unhealthy backend as healthy again.
+  
+  **Default**: 2 (from `src/config.rs:49`)
+  
+  **Purpose**: Ensures backends are stable before reintroducing them to the pool.
+  
+  **Example**: A failed backend must pass 2 checks in a row (60+ seconds) before receiving traffic again.
+</ParamField>
+
+<ParamField path="max_slot_lag" type="integer" default="50">
+  Maximum allowed slot lag behind the network before considering a backend unhealthy.
+  
+  **Default**: 50 slots (from `src/config.rs:50`)
+  
+  **Purpose**: Detects backends that are syncing or falling behind the network.
+  
+  <Note>
+    This is compared against the highest slot seen across all backends. A backend with slot lag exceeding this threshold is marked unhealthy even if responding successfully.
+  </Note>
+</ParamField>
+
+## Health Check Lifecycle
+
+### Initial State
+
+All backends start in a **healthy** state when the router launches.
+
+### Failure Detection
+
+1. Health check probe sent every `interval_secs`
+2. If response not received within `timeout_secs`, counted as failure
+3. After `consecutive_failures_threshold` consecutive failures, backend marked **unhealthy**
+4. Unhealthy backends are removed from load balancing pool
+
+### Recovery
+
+1. Health checks continue for unhealthy backends
+2. After `consecutive_successes_threshold` consecutive successes, backend marked **healthy**
+3. Healthy backends are reintroduced to the load balancing pool
+
+### Slot Lag Detection
+
+1. `getSlot` responses are compared across all backends
+2. If a backend's slot is more than `max_slot_lag` behind the highest seen slot, it's marked unhealthy
+3. Backend remains unhealthy until it catches up
+
+## Examples
+
+### Aggressive Health Checks (Fast Failure Detection)
+
+```toml
+[health_check]
+interval_secs = 10
+timeout_secs = 2
+method = "getSlot"
+consecutive_failures_threshold = 2
+consecutive_successes_threshold = 1
+max_slot_lag = 25
+```
+
+- Checks every 10 seconds
+- 2-second timeout
+- Mark unhealthy after 2 failures (20+ seconds)
+- Mark healthy after 1 success (10+ seconds)
+- Low tolerance for slot lag
+
+<Warning>
+  Aggressive settings may cause false positives during network congestion.
+</Warning>
+
+### Conservative Health Checks (Stable Backends)
+
+```toml
+[health_check]
+interval_secs = 60
+timeout_secs = 10
+method = "getSlot"
+consecutive_failures_threshold = 5
+consecutive_successes_threshold = 3
+max_slot_lag = 100
+```
+
+- Checks every 60 seconds
+- 10-second timeout
+- Mark unhealthy after 5 failures (300+ seconds / 5 minutes)
+- Mark healthy after 3 successes (180+ seconds / 3 minutes)
+- High tolerance for slot lag
+
+<Note>
+  Conservative settings reduce overhead but increase time to detect failures.
+</Note>
+
+### Default Configuration
+
+```toml
+[health_check]
+interval_secs = 30
+timeout_secs = 5
+method = "getSlot"
+consecutive_failures_threshold = 3
+consecutive_successes_threshold = 2
+max_slot_lag = 50
+```
+
+Balanced settings suitable for most production deployments (from `src/config.rs:42-52`).
+
+## Monitoring Health Status
+
+Backend health status is exposed via Prometheus metrics:
+
+```
+backend_health{label="mainnet-primary"} 1  # 1 = healthy, 0 = unhealthy
+backend_health{label="backup-rpc"} 0       # currently unhealthy
+```
+
+You can also check health via the metrics endpoint:
+
+```bash
+curl http://localhost:28901/metrics | grep backend_health
+```
+
+## Best Practices
+
+<Card title="Choose appropriate intervals" icon="clock">
+  Balance between fast failure detection and overhead. 30 seconds is a good starting point.
+</Card>
+
+<Card title="Set timeout < interval" icon="timer">
+  Ensure `timeout_secs` is significantly less than `interval_secs` to prevent overlapping checks.
+</Card>
+
+<Card title="Use lightweight methods" icon="feather">
+  `getSlot` is fast and doesn't require parameters. Avoid methods that query large amounts of data.
+</Card>
+
+<Card title="Tune thresholds for your network" icon="sliders">
+  Higher thresholds reduce false positives but increase detection time. Adjust based on your backend reliability.
+</Card>
+
+<Card title="Monitor slot lag" icon="gauge">
+  Set `max_slot_lag` based on your tolerance for stale data. Lower values ensure fresher data but may exclude slower nodes.
+</Card>
+
+## Troubleshooting
+
+### Backend Frequently Marked Unhealthy
+
+**Symptoms**: Backend oscillates between healthy and unhealthy
+
+**Solutions**:
+- Increase `consecutive_failures_threshold` to tolerate transient failures
+- Increase `timeout_secs` if backend is slow but reliable
+- Check backend logs for actual issues
+
+### Backend Stays Unhealthy After Recovery
+
+**Symptoms**: Backend is operational but router doesn't use it
+
+**Solutions**:
+- Check if slot lag exceeds `max_slot_lag`
+- Decrease `consecutive_successes_threshold` for faster recovery
+- Verify backend is actually responding to health check method
+
+### Health Checks Timing Out
+
+**Symptoms**: Frequent timeout errors in logs
+
+**Solutions**:
+- Increase `timeout_secs` (backend may be slow)
+- Check network latency to backend
+- Try a different health check `method`
+
+## Default Values Reference
+
+From `src/config.rs:42-52`:
+
+```rust
+impl Default for HealthCheckConfig {
+    fn default() -> Self {
+        Self {
+            interval_secs: 30,
+            timeout_secs: 5,
+            method: "getSlot".to_string(),
+            consecutive_failures_threshold: 3,
+            consecutive_successes_threshold: 2,
+            max_slot_lag: 50,
+        }
+    }
+}
+```
+
+All parameters are optional and fall back to these defaults if not specified.

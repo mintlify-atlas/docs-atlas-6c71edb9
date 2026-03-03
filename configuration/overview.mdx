@@ -1,0 +1,201 @@
+---
+title: 'Configuration Overview'
+description: 'Understanding the Sol RPC Router configuration system and file structure'
+---
+
+## Introduction
+
+Sol RPC Router uses TOML-based configuration files to define backends, routing rules, health checks, and proxy behavior. All configuration is validated on startup to ensure consistency and prevent runtime errors.
+
+## Configuration File Location
+
+By default, the router loads configuration from `config.toml` in the current directory. You can specify a custom path using the `--config` flag:
+
+```bash
+./sol-rpc-router --config /path/to/config.toml
+```
+
+## File Structure
+
+A complete configuration file contains the following sections:
+
+```toml
+# Server Configuration
+port = 28899
+metrics_port = 28901
+redis_url = "redis://127.0.0.1:6379/0"
+
+# Backend Definitions
+[[backends]]
+label = "mainnet-primary"
+url = "https://api.mainnet-beta.solana.com"
+weight = 10
+ws_url = "wss://api.mainnet-beta.solana.com"
+
+# Proxy Settings
+[proxy]
+timeout_secs = 30
+
+# Health Check Configuration
+[health_check]
+interval_secs = 30
+timeout_secs = 5
+method = "getSlot"
+consecutive_failures_threshold = 3
+consecutive_successes_threshold = 2
+max_slot_lag = 50
+
+# Method-Based Routing
+[method_routes]
+getSlot = "mainnet-primary"
+```
+
+## Required vs Optional Sections
+
+### Required
+
+<ParamField path="port" type="integer" required>
+  HTTP server port for incoming RPC requests
+</ParamField>
+
+<ParamField path="metrics_port" type="integer" required>
+  Port for Prometheus metrics endpoint
+  
+  <Warning>Must be different from `port` and WebSocket port (`port + 1`)</Warning>
+</ParamField>
+
+<ParamField path="redis_url" type="string" required>
+  Redis connection URL for rate limiting and caching
+  
+  <Note>Cannot be empty. Example: `redis://127.0.0.1:6379/0`</Note>
+</ParamField>
+
+<ParamField path="backends" type="array" required>
+  Array of backend RPC nodes. At least one backend must be configured.
+  
+  See [Backend Configuration](/configuration/backends) for details.
+</ParamField>
+
+### Optional
+
+<ParamField path="proxy" type="object">
+  Proxy behavior settings. Defaults to 30-second timeout if omitted.
+  
+  See [Proxy Configuration](#proxy-settings) for details.
+</ParamField>
+
+<ParamField path="health_check" type="object">
+  Health check settings. Uses default values if omitted.
+  
+  See [Health Check Configuration](/configuration/health-checks) for details.
+</ParamField>
+
+<ParamField path="method_routes" type="object">
+  Method-specific routing overrides. Optional.
+  
+  See [Method Routing](/configuration/method-routing) for details.
+</ParamField>
+
+## Validation Rules
+
+The configuration is validated on startup with the following checks:
+
+<Check>Configuration file must exist at the specified path</Check>
+<Check>Redis URL must be non-empty</Check>
+<Check>At least one backend must be configured</Check>
+<Check>All backend labels must be unique</Check>
+<Check>All backend weights must be greater than 0</Check>
+<Check>All backend labels must be non-empty</Check>
+<Check>Proxy timeout must be greater than 0</Check>
+<Check>HTTP port and metrics port must be different</Check>
+<Check>Metrics port cannot conflict with WebSocket port (HTTP port + 1)</Check>
+<Check>Method routes must reference existing backend labels</Check>
+
+<Warning>
+  If any validation fails, the router will exit with an error message indicating the specific issue.
+</Warning>
+
+## Proxy Settings
+
+<ParamField path="proxy.timeout_secs" type="integer" default="30">
+  Timeout in seconds for upstream backend requests
+  
+  **Validation**: Must be greater than 0
+</ParamField>
+
+## Port Configuration
+
+The router uses multiple ports:
+
+- **HTTP Port**: Main RPC endpoint (`port`)
+- **WebSocket Port**: Automatically set to `port + 1`
+- **Metrics Port**: Prometheus metrics (`metrics_port`)
+
+<Warning>
+  Ensure your metrics port doesn't conflict with the HTTP port or WebSocket port. For example, if `port = 8080`, the WebSocket will use `8081`, so `metrics_port` cannot be `8080` or `8081`.
+</Warning>
+
+## Example Configurations
+
+### Minimal Configuration
+
+```toml
+port = 8081
+metrics_port = 8082
+redis_url = "redis://127.0.0.1:6379"
+
+[[backends]]
+label = "primary"
+url = "https://api.mainnet-beta.solana.com"
+weight = 1
+```
+
+### Production Configuration
+
+```toml
+port = 28899
+metrics_port = 28901
+redis_url = "redis://127.0.0.1:6379/0"
+
+[[backends]]
+label = "mainnet-primary"
+url = "https://api.mainnet-beta.solana.com"
+weight = 10
+ws_url = "wss://api.mainnet-beta.solana.com"
+
+[[backends]]
+label = "backup-rpc"
+url = "https://solana-api.com"
+weight = 5
+
+[proxy]
+timeout_secs = 30
+
+[health_check]
+interval_secs = 30
+timeout_secs = 5
+method = "getSlot"
+consecutive_failures_threshold = 3
+consecutive_successes_threshold = 2
+max_slot_lag = 50
+
+[method_routes]
+getSlot = "mainnet-primary"
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Backend Configuration" icon="server" href="/configuration/backends">
+    Configure RPC backends with weights and WebSocket support
+  </Card>
+  <Card title="Health Checks" icon="heart-pulse" href="/configuration/health-checks">
+    Set up automatic health monitoring for backends
+  </Card>
+  <Card title="Rate Limiting" icon="gauge" href="/configuration/rate-limiting">
+    Configure per-API-key rate limits
+  </Card>
+  <Card title="Method Routing" icon="route" href="/configuration/method-routing">
+    Route specific RPC methods to designated backends
+  </Card>
+</CardGroup>

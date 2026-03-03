@@ -1,0 +1,403 @@
+---
+title: 'API Key Authentication'
+description: 'Redis-backed authentication with local caching and per-key rate limiting'
+---
+
+## Overview
+
+Sol RPC Router implements a two-tier authentication system using Redis for persistent storage and Moka for in-memory caching. Every request (HTTP and WebSocket) requires a valid API key passed as a query parameter.
+
+## Architecture
+
+Authentication is handled by the `RedisKeyStore` implementation in `src/keystore.rs:18-141`, which provides:
+
+- **Redis Storage**: API keys stored as Redis hashes under `api_key:{key}`
+- **Local Cache**: 60-second TTL cache using Moka to minimize Redis round-trips
+- **Rate Limiting**: Atomic per-key RPS limits enforced via Lua script
+
+### Key Information Structure
+
+```rust src/keystore.rs
+pub struct KeyInfo {
+    pub owner: String,
+    pub rate_limit: u64,
+}
+```
+
+Each API key stores:
+- `owner`: Client identifier for tracking and metrics
+- `active`: Boolean flag to enable/disable keys without deletion
+- `rate_limit`: Maximum requests per second (0 = unlimited)
+
+## Authentication Flow
+
+### 1. Query Parameter Extraction
+
+API keys are passed via the `api-key` query parameter:
+
+```bash
+curl "http://localhost:28899/?api-key=your-key-here" \
+  -X POST \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"getSlot"}'
+```
+
+The handler extracts the key from query parameters (src/handlers.rs:145-151):
+
+```rust src/handlers.rs
+let api_key = match params.api_key {
+    Some(k) => k,
+    None => {
+        info!("No API key provided");
+        return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+    }
+};
+```
+
+### 2. Key Validation
+
+The validation process runs through three stages:
+
+<Steps>
+  <Step title="Cache Lookup">
+    Check local Moka cache (60s TTL) to avoid Redis roundtrip
+    
+    ```rust src/keystore.rs
+    if let Some(info) = self.cache.get(key).await {
+        return Ok(info);
+    }
+    ```
+  </Step>
+  
+  <Step title="Redis Lookup">
+    Query Redis for key details if not cached
+    
+    ```rust src/keystore.rs
+    let redis_key = format!("api_key:{}", key);
+    let exists: bool = redis::cmd("EXISTS")
+        .arg(&redis_key)
+        .query_async(&mut conn)
+        .await
+        .map_err(|e| e.to_string())?;
+    ```
+  </Step>
+  
+  <Step title="Rate Limit Check">
+    Enforce per-key rate limits using atomic Redis operations
+    
+    ```rust src/keystore.rs
+    let script = redis::Script::new(
+        r#"
+        local count = redis.call("INCR", KEYS[1])
+        if count == 1 then
+            redis.call("EXPIRE", KEYS[1], 1)
+        end
+        return count
+    "#,
+    );
+    ```
+  </Step>
+</Steps>
+
+### 3. Response Codes
+
+Authentication failures return specific HTTP status codes:
+
+| Status Code | Scenario | Response |
+|-------------|----------|----------|
+| `401 Unauthorized` | No API key provided | `"Unauthorized"` |
+| `401 Unauthorized` | Invalid API key | `"Unauthorized"` |
+| `401 Unauthorized` | Key marked inactive | `"Unauthorized"` |
+| `429 Too Many Requests` | Rate limit exceeded | `"Rate limit exceeded"` |
+| `500 Internal Server Error` | Redis connection error | `"Internal Server Error"` |
+
+## Redis Schema
+
+### API Key Hash
+
+Each API key is stored as a Redis hash:
+
+```redis
+HMSET api_key:your-key-here
+  owner "my-client"
+  active "true"
+  rate_limit 50
+```
+
+**Fields:**
+- `owner` (required): Client identifier for tracking
+- `active` (optional, default `true`): Enable/disable flag
+- `rate_limit` (required): Maximum requests per second (0 = unlimited)
+
+### Rate Limit Counter
+
+Rate limiting uses ephemeral counters with 1-second expiration:
+
+```redis
+# Atomic increment with auto-expire
+INCR rate_limit:your-key-here  # Returns current count
+EXPIRE rate_limit:your-key-here 1  # Set on first increment
+```
+
+The Lua script (src/keystore.rs:101-109) ensures atomicity:
+1. Increment the counter for this key
+2. If counter was just created (count == 1), set 1-second TTL
+3. Return current count
+4. If count > rate_limit, reject the request
+
+## Caching Strategy
+
+### Cache Configuration
+
+```rust src/keystore.rs
+let cache = Cache::builder()
+    .time_to_live(Duration::from_secs(60)) // Cache keys for 1 min
+    .build();
+```
+
+### Cache Behavior
+
+- **Positive Results**: Valid keys are cached for 60 seconds
+- **Negative Results**: Invalid keys are cached as `None` to prevent repeated Redis lookups
+- **Inactive Keys**: Cached as `None` after checking the `active` field
+- **Automatic Expiration**: TTL-based eviction ensures revoked keys are checked within 60s
+
+<Note>
+Caching both hits and misses significantly reduces Redis load, especially during attack scenarios where invalid keys are repeatedly presented.
+</Note>
+
+## WebSocket Authentication
+
+WebSocket upgrades follow the same authentication flow (src/handlers.rs:355-387):
+
+```rust src/handlers.rs
+pub async fn ws_proxy(
+    ws: WebSocketUpgrade,
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<Params>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+) -> impl IntoResponse {
+    let api_key = match params.api_key {
+        Some(k) => k,
+        None => {
+            counter!("ws_connections_total", 
+                "backend" => "none", 
+                "owner" => "none", 
+                "status" => "auth_failed").increment(1);
+            return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+        }
+    };
+    
+    // Validate API key before upgrade
+    let owner = match state.keystore.validate_key(&api_key).await {
+        Ok(Some(info)) => info.owner,
+        Ok(None) => {
+            counter!("ws_connections_total", 
+                "backend" => "none", 
+                "owner" => "none", 
+                "status" => "auth_failed").increment(1);
+            return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+        }
+        // ... rate limit and error handling
+    };
+}
+```
+
+**Key Points:**
+- Authentication happens **before** the WebSocket upgrade
+- Failed authentication prevents the upgrade (returns HTTP error)
+- Rate limits apply to WebSocket upgrade requests
+- The `owner` is tracked in WebSocket metrics
+
+## Managing API Keys
+
+Use the `rpc-admin` CLI tool to manage keys:
+
+### Create a Key
+
+```bash
+# Auto-generate a random key
+./rpc-admin create my-client --rate-limit 50
+
+# Use a specific key value
+./rpc-admin create my-client --rate-limit 50 --key custom-key-123
+```
+
+### List All Keys
+
+```bash
+./rpc-admin list
+```
+
+### Inspect Key Details
+
+```bash
+./rpc-admin inspect your-key-here
+```
+
+Output:
+```json
+{
+  "owner": "my-client",
+  "active": "true",
+  "rate_limit": "50"
+}
+```
+
+### Update Key Settings
+
+```bash
+# Change rate limit
+./rpc-admin update your-key-here --rate-limit 100
+
+# Disable without deleting
+./rpc-admin update your-key-here --active false
+```
+
+### Revoke a Key
+
+```bash
+./rpc-admin revoke your-key-here
+```
+
+<Warning>
+Revoked keys may remain in the local cache for up to 60 seconds before all router instances recognize the revocation.
+</Warning>
+
+## Rate Limiting Details
+
+### Implementation
+
+Rate limiting is enforced at the **per-key** level using Redis atomic operations:
+
+```rust src/keystore.rs
+async fn check_rate_limit(&self, key: &str, limit: u64) -> Result<bool, String> {
+    if limit == 0 {
+        return Ok(true); // No limit
+    }
+
+    let mut conn = self.conn.clone();
+    let redis_key = format!("rate_limit:{}", key);
+
+    let script = redis::Script::new(
+        r#"
+        local count = redis.call("INCR", KEYS[1])
+        if count == 1 then
+            redis.call("EXPIRE", KEYS[1], 1)
+        end
+        return count
+    "#,
+    );
+
+    let count: u64 = script
+        .key(&redis_key)
+        .invoke_async(&mut conn)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if count > limit {
+        return Ok(false);
+    }
+
+    Ok(true)
+}
+```
+
+### Behavior
+
+- **Sliding Window**: 1-second window with automatic reset
+- **Atomic Operations**: Lua script ensures race-free counting
+- **No Limit**: Setting `rate_limit` to `0` disables rate limiting
+- **Per-Key Isolation**: Each API key has independent rate limits
+
+### Error Handling
+
+When rate limits are exceeded:
+
+```rust src/handlers.rs
+Err(e) => {
+    if e == "Rate limit exceeded" {
+        warn!("API key rate limited (prefix={}...)", 
+            &api_key[..api_key.len().min(6)]);
+        return (StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded")
+            .into_response();
+    }
+}
+```
+
+## Metrics and Monitoring
+
+Authentication events are tracked in metrics with the `owner` label:
+
+```rust src/handlers.rs
+histogram!("rpc_request_duration_seconds", 
+    "rpc_method" => rpc_method.clone(), 
+    "backend" => backend.clone(), 
+    "owner" => owner.clone())
+    .record(duration);
+
+counter!("rpc_requests_total", 
+    "method" => method, 
+    "status" => status, 
+    "rpc_method" => rpc_method, 
+    "backend" => backend, 
+    "owner" => owner)
+    .increment(1);
+```
+
+See [Metrics](/features/metrics) for details on querying by owner.
+
+## Security Considerations
+
+<AccordionGroup>
+  <Accordion title="Cache Timing">
+    Invalid keys are cached for 60 seconds to prevent Redis abuse. This means:
+    - Revoked keys may work for up to 60 more seconds
+    - Consider reducing TTL if immediate revocation is critical
+    - Balance cache duration against Redis load
+  </Accordion>
+  
+  <Accordion title="Key Logging">
+    API keys are partially logged for debugging (src/handlers.rs:158):
+    
+    ```rust
+    info!("Invalid API key presented (prefix={}...)", 
+        &api_key[..api_key.len().min(6)]);
+    ```
+    
+    Only the first 6 characters are logged to balance security and debuggability.
+  </Accordion>
+  
+  <Accordion title="Rate Limit Precision">
+    Rate limits are enforced per-second with atomic counters. Under high load:
+    - Concurrent requests may briefly exceed the limit
+    - Redis RTT affects enforcement latency
+    - Consider setting limits 10-20% below hard thresholds
+  </Accordion>
+  
+  <Accordion title="Redis Availability">
+    Redis downtime affects all authentication:
+    - Cached keys continue working for up to 60 seconds
+    - New connections fail with 500 Internal Server Error
+    - Consider Redis clustering for high availability
+  </Accordion>
+</AccordionGroup>
+
+## Configuration
+
+Set the Redis URL in `config.toml`:
+
+```toml config.toml
+redis_url = "redis://127.0.0.1:6379/0"
+```
+
+Or via environment variable for the admin CLI:
+
+```bash
+export REDIS_URL="redis://127.0.0.1:6379/0"
+./rpc-admin list
+```
+
+<Check>
+Redis connection is validated at startup (src/main.rs:99-105). The router exits with code 1 if Redis is unreachable.
+</Check>

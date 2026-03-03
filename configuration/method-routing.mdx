@@ -1,0 +1,389 @@
+---
+title: 'Method-Based Routing'
+description: 'Route specific RPC methods to designated backends'
+---
+
+## Overview
+
+Method-based routing allows you to send specific RPC methods to designated backends, overriding the default weighted random load balancing. This is useful for:
+
+- Routing heavy queries to archive nodes
+- Sending time-sensitive methods to low-latency nodes
+- Isolating experimental methods to test backends
+- Optimizing backend resource utilization
+
+## Configuration
+
+Method routes are defined in the `[method_routes]` section:
+
+```toml
+[method_routes]
+getSlot = "mainnet-primary"
+getAccountInfo = "archive-node"
+getTransaction = "archive-node"
+```
+
+<Note>
+  The entire `[method_routes]` section is optional. If omitted, all methods use weighted random load balancing.
+</Note>
+
+## Syntax
+
+<ParamField path="[method_routes]" type="object">
+  Key-value pairs mapping RPC method names to backend labels.
+  
+  **Format**: `method_name = "backend_label"`
+  
+  **Requirements**:
+  - Method name must match exact Solana RPC method (case-sensitive)
+  - Backend label must reference an existing backend from `[[backends]]`
+  
+  <Warning>
+    Referencing a non-existent backend label causes validation error: "Method route '[method]' references unknown backend label '[label]'" (from `src/config.rs:101-109`)
+  </Warning>
+</ParamField>
+
+## Validation
+
+Method routes are validated on startup:
+
+<Check>All referenced backend labels must exist in the `backends` array</Check>
+<Check>Backend labels are case-sensitive and must match exactly</Check>
+<Check>Invalid routes prevent router startup</Check>
+
+From `src/config.rs:101-109`:
+
+```rust
+for (method, label) in &config.method_routes {
+    if !backend_labels.contains_key(label) {
+        return Err(format!(
+            "Method route '{}' references unknown backend label '{}'",
+            method, label
+        )
+        .into());
+    }
+}
+```
+
+## Routing Behavior
+
+### With Method Route Configured
+
+1. Request with method `getSlot` arrives
+2. Router checks `[method_routes]`
+3. Finds `getSlot = "mainnet-primary"`
+4. Routes request directly to backend labeled `"mainnet-primary"`
+5. **No load balancing** - always uses specified backend
+
+### Without Method Route
+
+1. Request with method `getBalance` arrives
+2. Router checks `[method_routes]`
+3. No route configured for `getBalance`
+4. Falls back to **weighted random load balancing** across all healthy backends
+
+<Note>
+  Health checks still apply. If the designated backend is unhealthy, the request will fail even with method routing configured.
+</Note>
+
+## Common Use Cases
+
+### Archive Node Routing
+
+Route historical queries to nodes with full history:
+
+```toml
+[[backends]]
+label = "fast-node"
+url = "https://api.mainnet-beta.solana.com"
+weight = 10
+
+[[backends]]
+label = "archive-node"
+url = "https://archive.solana.com"
+weight = 5
+
+[method_routes]
+getTransaction = "archive-node"
+getBlock = "archive-node"
+getConfirmedBlock = "archive-node"
+```
+
+### Low-Latency Routing
+
+Send time-sensitive methods to fastest node:
+
+```toml
+[[backends]]
+label = "low-latency"
+url = "https://fast-rpc.example.com"
+weight = 5
+
+[[backends]]
+label = "standard"
+url = "https://standard-rpc.example.com"
+weight = 10
+
+[method_routes]
+getSlot = "low-latency"
+getBlockHeight = "low-latency"
+getEpochInfo = "low-latency"
+```
+
+### Backend Isolation
+
+Isolate specific methods during testing:
+
+```toml
+[[backends]]
+label = "production"
+url = "https://prod-rpc.example.com"
+weight = 10
+
+[[backends]]
+label = "test"
+url = "https://test-rpc.example.com"
+weight = 1
+
+[method_routes]
+getBlockProduction = "test"  # Test new backend with one method
+```
+
+### Specialized Backend Features
+
+Route to backends with specific capabilities:
+
+```toml
+[[backends]]
+label = "standard"
+url = "https://rpc.example.com"
+weight = 10
+
+[[backends]]
+label = "geyser-node"
+url = "https://geyser-rpc.example.com"
+weight = 5
+
+[method_routes]
+getProgramAccounts = "geyser-node"  # Use Geyser plugin for efficient queries
+```
+
+## Complete Example
+
+From `config.example.toml:1-28`:
+
+```toml
+port = 28899
+metrics_port = 28901
+redis_url = "redis://127.0.0.1:6379/0"
+
+[[backends]]
+label = "mainnet-primary"
+url = "https://api.mainnet-beta.solana.com"
+weight = 10
+ws_url = "wss://api.mainnet-beta.solana.com"
+
+[[backends]]
+label = "backup-rpc"
+url = "https://solana-api.com"
+weight = 5
+
+[proxy]
+timeout_secs = 30
+
+[health_check]
+interval_secs = 30
+timeout_secs = 5
+method = "getSlot"
+consecutive_failures_threshold = 3
+consecutive_successes_threshold = 2
+max_slot_lag = 50
+
+[method_routes]
+getSlot = "mainnet-primary"
+```
+
+In this configuration:
+- `getSlot` always routed to `"mainnet-primary"`
+- All other methods load balanced between `"mainnet-primary"` (67% weight) and `"backup-rpc"` (33% weight)
+
+## Common Solana RPC Methods
+
+Popular methods you might want to route:
+
+### State Queries
+- `getAccountInfo` - Account data retrieval
+- `getBalance` - Account balance
+- `getProgramAccounts` - Program-owned accounts (heavy)
+- `getMultipleAccounts` - Batch account data
+
+### Block & Transaction Queries
+- `getBlock` - Block data (archive)
+- `getTransaction` - Transaction details (archive)
+- `getRecentBlockhash` - Latest blockhash
+- `getSlot` - Current slot number
+
+### Subscription Methods (WebSocket)
+- `accountSubscribe` - Account change notifications
+- `logsSubscribe` - Transaction log streaming
+- `slotSubscribe` - Slot change notifications
+
+### Cluster Info
+- `getEpochInfo` - Current epoch data
+- `getBlockHeight` - Current block height
+- `getHealth` - Node health status
+- `getVersion` - Node version info
+
+<Note>
+  See [Solana RPC API](https://docs.solana.com/api/http) for complete method list.
+</Note>
+
+## Monitoring Method Routes
+
+Metrics track routing decisions:
+
+```
+method_route_hits_total{method="getSlot",backend="mainnet-primary"} 1543
+load_balanced_requests_total{method="getBalance"} 892
+```
+
+Query routing statistics:
+
+```bash
+curl http://localhost:28901/metrics | grep method_route
+```
+
+## Best Practices
+
+<Card title="Route heavy queries" icon="weight-hanging">
+  Send `getProgramAccounts` and other heavy methods to dedicated backends to prevent impacting light queries.
+</Card>
+
+<Card title="Use archive nodes for history" icon="clock-rotate-left">
+  Route `getTransaction`, `getBlock`, and `getConfirmedBlock` to nodes with full historical data.
+</Card>
+
+<Card title="Keep health checks simple" icon="heart-pulse">
+  Don't route the health check method (`getSlot` by default) - let it use load balancing to test all backends.
+</Card>
+
+<Card title="Test routing changes" icon="flask">
+  Verify method routes in development before deploying. Invalid backend labels prevent startup.
+</Card>
+
+<Card title="Monitor backend load" icon="chart-line">
+  Watch metrics to ensure routed methods don't overwhelm designated backends.
+</Card>
+
+<Card title="Document your routing" icon="book">
+  Comment your method routes to explain why specific methods go to specific backends.
+</Card>
+
+## Troubleshooting
+
+### Validation Error on Startup
+
+**Error**: `Method route 'getSlot' references unknown backend label 'fast-node'`
+
+**Solution**: Ensure backend label exists in `[[backends]]` array:
+
+```toml
+[[backends]]
+label = "fast-node"  # Label must match exactly
+url = "https://fast-rpc.com"
+weight = 5
+
+[method_routes]
+getSlot = "fast-node"  # Must reference existing label
+```
+
+### Method Always Fails
+
+**Symptoms**: Specific method returns errors while others work
+
+**Solutions**:
+- Check if designated backend is healthy: `curl http://localhost:28901/metrics | grep backend_health`
+- Verify backend supports the method
+- Test backend directly: `curl -X POST [backend_url] -d '{"jsonrpc":"2.0","id":1,"method":"[method]"}'`
+- Check backend logs for errors
+
+### Case Sensitivity Issues
+
+**Symptoms**: Method routing not working despite correct configuration
+
+**Solution**: Ensure exact method name match (case-sensitive):
+
+```toml
+# Correct
+getSlot = "backend"
+
+# Incorrect
+GetSlot = "backend"  # Wrong case
+get_slot = "backend"  # Wrong format
+```
+
+## Advanced Patterns
+
+### Fallback with Multiple Backends
+
+Combine method routing with weighted backends for fallback:
+
+```toml
+[[backends]]
+label = "primary-archive"
+url = "https://archive1.example.com"
+weight = 10
+
+[[backends]]
+label = "secondary-archive"
+url = "https://archive2.example.com"
+weight = 5
+
+# Route to primary, but if unhealthy, only secondary handles non-routed methods
+[method_routes]
+getTransaction = "primary-archive"
+```
+
+<Warning>
+  Method routes don't support automatic failover. If the designated backend is unhealthy, requests will fail.
+</Warning>
+
+### Gradual Migration
+
+Test new backend with subset of methods:
+
+```toml
+[[backends]]
+label = "old-backend"
+url = "https://old-rpc.example.com"
+weight = 10
+
+[[backends]]
+label = "new-backend"
+url = "https://new-rpc.example.com"
+weight = 1
+
+# Gradually route methods to new backend
+[method_routes]
+getSlot = "new-backend"
+getBlockHeight = "new-backend"
+# Other methods still load balanced
+```
+
+## Integration with Other Features
+
+### Health Checks
+
+Method routes respect health check status. If the designated backend is unhealthy, routed requests fail.
+
+### Load Balancing
+
+Only unrouted methods participate in weighted random load balancing.
+
+### Rate Limiting
+
+Rate limits apply before routing - method routes don't affect rate limiting behavior.
+
+### WebSocket
+
+Method routes apply to both HTTP and WebSocket requests with matching method names.

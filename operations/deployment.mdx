@@ -1,0 +1,307 @@
+---
+title: 'Deployment Guide'
+description: 'Deploy Sol RPC Router to production with proper environment setup'
+---
+
+## Prerequisites
+
+Before deploying the Sol RPC Router, ensure you have:
+
+- **Rust 2021 edition** (stable toolchain)
+- **Redis** instance for API key storage and rate limiting
+- **Prometheus** (optional) for metrics collection
+- **Grafana** (optional) for dashboard visualization
+
+## Building the Application
+
+### Production Build
+
+Compile the router with optimizations:
+
+```bash
+cargo build --release
+```
+
+This creates two binaries:
+- `target/release/sol-rpc-router` - Main RPC proxy server
+- `target/release/rpc-admin` - CLI tool for API key management
+
+## Configuration
+
+### Environment Setup
+
+Create a production configuration file (`config.toml`):
+
+```toml
+port = 28899
+metrics_port = 28901
+redis_url = "redis://127.0.0.1:6379/0"
+
+[[backends]]
+label = "mainnet-primary"
+url = "https://api.mainnet-beta.solana.com"
+weight = 10
+ws_url = "wss://api.mainnet-beta.solana.com"   # optional
+
+[[backends]]
+label = "backup-rpc"
+url = "https://solana-api.com"
+weight = 5
+
+[proxy]
+timeout_secs = 30                     # upstream request timeout
+
+[health_check]
+interval_secs = 30                    # check frequency
+timeout_secs = 5                      # per-check timeout
+method = "getSlot"                    # RPC method used for probes
+consecutive_failures_threshold = 3    # failures before marking unhealthy
+consecutive_successes_threshold = 2   # successes before marking healthy
+max_slot_lag = 100                    # maximum allowed slot lag
+
+[method_routes]                       # optional per-method overrides
+getSlot = "mainnet-primary"
+```
+
+### Configuration Validation
+
+The router validates configuration on startup:
+
+- `redis_url` must be non-empty
+- At least one backend required
+- Backend labels must be unique and non-empty
+- Backend weights must be > 0
+- `proxy.timeout_secs` must be > 0
+- `method_routes` values must reference existing backend labels
+
+## Starting the Router
+
+### Basic Startup
+
+```bash
+./target/release/sol-rpc-router --config config.toml
+```
+
+### Startup Logs
+
+On successful startup, you'll see:
+
+```
+Loaded configuration from: config.toml
+Redis URL configured (host redacted)
+Loaded 2 backends
+  - [mainnet-primary] https://api.mainnet-beta.solana.com (weight: 10)
+  - [backup-rpc] https://solana-api.com (weight: 5)
+Method routing overrides:
+  - getSlot -> mainnet-primary
+Starting health check loop
+HTTP server listening on http://0.0.0.0:28899
+WebSocket server listening on ws://0.0.0.0:28900
+Metrics server listening on http://0.0.0.0:28901
+Health monitoring endpoint: http://0.0.0.0:28899/health
+```
+
+## Server Architecture
+
+The router starts **three concurrent servers**:
+
+### 1. HTTP Server (Port 28899)
+
+Handles JSON-RPC requests:
+- `POST /` - Main RPC proxy endpoint
+- `POST /*path` - Proxy with subpath support
+- `GET /health` - Health check endpoint
+- `GET /` (WebSocket upgrade) - WebSocket connections on main port
+
+### 2. WebSocket Server (Port 28900)
+
+Dedicated WebSocket port following Solana convention (HTTP port + 1):
+- `ws://host:28900/` - WebSocket subscriptions
+
+Both WebSocket ports use the same authentication and load balancing.
+
+### 3. Metrics Server (Port 28901)
+
+Prometheus metrics endpoint:
+- `GET /metrics` - Prometheus-formatted metrics
+
+## Production Considerations
+
+### Redis Connection
+
+The router fails immediately if Redis is unavailable:
+
+```
+Failed to initialize Redis KeyStore: Connection refused
+```
+
+Ensure Redis is running and accessible before starting the router.
+
+### Health Checks
+
+A background task continuously monitors backend health:
+- Runs every `interval_secs` (default: 30s)
+- Calls configured RPC method (default: `getSlot`)
+- Tracks consecutive failures/successes
+- Updates backend health status atomically
+- Marks backends unhealthy after threshold failures
+- Excludes unhealthy backends from load balancing
+
+### Slot Lag Detection
+
+The health checker compares backend slots:
+- Determines consensus tip (max slot across all backends)
+- Marks backends as unhealthy if they lag by more than `max_slot_lag` slots
+- Logs warnings when lag is detected
+
+### Port Availability
+
+The router requires three consecutive ports:
+- HTTP port (configurable, default: 28899)
+- WebSocket port (HTTP port + 1, default: 28900)
+- Metrics port (configurable, default: 28901)
+
+Ensure all ports are available before starting.
+
+## Creating API Keys
+
+Before accepting requests, create at least one API key:
+
+```bash
+# Create an API key with auto-generated value
+./target/release/rpc-admin create my-client --rate-limit 50
+
+# Create with a specific key value
+./target/release/rpc-admin create my-client --rate-limit 50 --key my-custom-key
+
+# List all keys
+./target/release/rpc-admin list
+```
+
+See the [API Key Management](/api/rpc-admin) guide for more details.
+
+## Process Management
+
+### Systemd Service
+
+Create `/etc/systemd/system/sol-rpc-router.service`:
+
+```ini
+[Unit]
+Description=Sol RPC Router
+After=network.target redis.service
+Requires=redis.service
+
+[Service]
+Type=simple
+User=solana
+WorkingDirectory=/opt/sol-rpc-router
+ExecStart=/opt/sol-rpc-router/sol-rpc-router --config /etc/sol-rpc-router/config.toml
+Restart=always
+RestartSec=10
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+
+# Security
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/sol-rpc-router
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable and start:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable sol-rpc-router
+sudo systemctl start sol-rpc-router
+sudo systemctl status sol-rpc-router
+```
+
+### Docker Deployment
+
+Create a `Dockerfile`:
+
+```dockerfile
+FROM rust:1.75 as builder
+WORKDIR /usr/src/sol-rpc-router
+COPY . .
+RUN cargo build --release
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /usr/src/sol-rpc-router/target/release/sol-rpc-router /usr/local/bin/
+COPY --from=builder /usr/src/sol-rpc-router/target/release/rpc-admin /usr/local/bin/
+
+EXPOSE 28899 28900 28901
+CMD ["sol-rpc-router", "--config", "/etc/config.toml"]
+```
+
+Build and run:
+
+```bash
+docker build -t sol-rpc-router .
+docker run -d \
+  --name sol-rpc-router \
+  -p 28899:28899 \
+  -p 28900:28900 \
+  -p 28901:28901 \
+  -v $(pwd)/config.toml:/etc/config.toml \
+  --link redis:redis \
+  sol-rpc-router
+```
+
+## Security
+
+### Network Security
+
+- **HTTP/WS ports (28899, 28900)**: Expose to clients
+- **Metrics port (28901)**: Restrict to monitoring systems only
+- **Redis**: Keep on private network, never expose publicly
+
+### API Key Security
+
+API keys are stored in Redis:
+- Use strong, randomly generated keys
+- Rotate keys regularly
+- Revoke compromised keys immediately with `rpc-admin revoke`
+
+### Rate Limiting
+
+Each API key has a per-second rate limit enforced atomically in Redis:
+- Prevents abuse
+- Protects backend infrastructure
+- Returns `429 Too Many Requests` when exceeded
+
+## Logging
+
+The router uses `tracing` for structured logging. Log levels:
+
+- `INFO`: Normal operations (requests, health checks, config reloads)
+- `WARN`: Non-critical issues (health check failures, rate limits)
+- `ERROR`: Critical errors (Redis failures, invalid config)
+
+### Setting Log Level
+
+Use the `RUST_LOG` environment variable:
+
+```bash
+RUST_LOG=info ./sol-rpc-router --config config.toml
+RUST_LOG=debug ./sol-rpc-router --config config.toml
+```
+
+## Next Steps
+
+- [Monitor your deployment](/operations/monitoring) with Prometheus and Grafana
+- [Configure hot reload](/operations/hot-reload) for zero-downtime updates
+- [Troubleshoot common issues](/operations/troubleshooting)

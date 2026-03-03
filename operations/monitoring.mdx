@@ -1,0 +1,431 @@
+---
+title: 'Monitoring'
+description: 'Monitor Sol RPC Router with Prometheus metrics and Grafana dashboards'
+---
+
+## Overview
+
+The Sol RPC Router exposes Prometheus metrics on a dedicated port (default: 28901) and includes pre-built Grafana dashboards for comprehensive monitoring.
+
+## Metrics Endpoint
+
+The router runs a dedicated metrics server:
+
+```
+Metrics server listening on http://0.0.0.0:28901
+```
+
+Access metrics at: `http://localhost:28901/metrics`
+
+### Prometheus Histogram Configuration
+
+The router configures Prometheus histograms with specific buckets for accurate latency percentile calculations:
+
+```rust
+PrometheusBuilder::new()
+    .set_buckets(&[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0])
+```
+
+This emits true Prometheus histograms (`_bucket`, `_sum`, `_count`) instead of summaries, enabling `histogram_quantile()` queries in Grafana.
+
+## Available Metrics
+
+### HTTP Request Metrics
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `rpc_requests_total` | Counter | `method`, `status`, `rpc_method`, `backend`, `owner` | Total RPC requests |
+| `rpc_request_duration_seconds` | Histogram | `rpc_method`, `backend`, `owner` | Request duration distribution |
+
+### Backend Health Metrics
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `rpc_backend_health` | Gauge | `backend` | Backend health status (1.0 = healthy, 0.0 = unhealthy) |
+
+### WebSocket Metrics
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `ws_connections_total` | Counter | `backend`, `owner`, `status` | Connection attempts |
+| `ws_active_connections` | Gauge | `backend`, `owner` | Currently open WebSocket sessions |
+| `ws_messages_total` | Counter | `backend`, `owner`, `direction` | Frames relayed (`client_to_backend` / `backend_to_client`) |
+| `ws_connection_duration_seconds` | Histogram | `backend`, `owner` | Session duration from upgrade to close |
+
+### WebSocket Connection Statuses
+
+The `ws_connections_total` metric tracks these status values:
+- `connected` - Successful connections
+- `auth_failed` - Invalid API key
+- `rate_limited` - Rate limit exceeded
+- `no_backend` - No healthy backends available
+- `backend_connect_failed` - Failed to connect to backend
+- `error` - Other errors
+
+## Prometheus Setup
+
+### Configuration
+
+Create `prometheus.yml`:
+
+```yaml
+global:
+  scrape_interval: 10s
+
+scrape_configs:
+  - job_name: 'sol-rpc-router'
+    metrics_path: '/metrics'
+    static_configs:
+      - targets: ['localhost:28901']
+```
+
+### Running Prometheus
+
+```bash
+# Using Docker
+docker run -d \
+  --name prometheus \
+  -p 9090:9090 \
+  -v $(pwd)/prometheus.yml:/etc/prometheus/prometheus.yml \
+  prom/prometheus
+
+# Using binary
+prometheus --config.file=prometheus.yml
+```
+
+Access Prometheus at `http://localhost:9090`
+
+### Verifying Metrics Collection
+
+1. Open Prometheus UI: `http://localhost:9090`
+2. Go to **Status → Targets**
+3. Verify `sol-rpc-router` target is **UP**
+4. Query metrics: `rpc_requests_total`
+
+## Grafana Setup
+
+### Quick Start with Docker Compose
+
+The repository includes a complete Grafana setup with provisioned datasources and dashboards.
+
+Create `docker-compose.yml`:
+
+```yaml
+version: '3'
+services:
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning
+      - ./grafana/dashboards:/etc/grafana/dashboards
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+```
+
+Start services:
+
+```bash
+docker-compose up -d
+```
+
+Access Grafana at `http://localhost:3000` (default credentials: `admin/admin`)
+
+### Datasource Configuration
+
+The repository includes automatic Prometheus datasource provisioning at `grafana/provisioning/datasources/datasource.yml`:
+
+```yaml
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+```
+
+### Dashboard Provisioning
+
+Dashboards are automatically loaded from `grafana/provisioning/dashboards/dashboard.yml`:
+
+```yaml
+apiVersion: 1
+
+providers:
+  - name: 'Default'
+    orgId: 1
+    folder: ''
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 10
+    options:
+      path: /etc/grafana/dashboards
+```
+
+## Pre-Built Dashboard
+
+The router includes a comprehensive Grafana dashboard at `grafana/dashboards/sol-rpc-router.json`.
+
+### Dashboard Panels
+
+#### Overall Performance
+
+**Total Requests Per Second**
+```promql
+sum(rate(rpc_requests_total[1m]))
+```
+
+**P99 Latency (seconds)**
+```promql
+histogram_quantile(0.99, sum(rate(rpc_request_duration_seconds_bucket[1m])) by (le))
+```
+
+#### Backend Monitoring
+
+**RPS by Backend**
+```promql
+sum(rate(rpc_requests_total[1m])) by (backend)
+```
+
+**Top 10 RPC Methods**
+```promql
+topk(10, sum(rate(rpc_requests_total[1m])) by (rpc_method))
+```
+
+#### WebSocket Section
+
+**WS Active Connections**
+```promql
+sum(ws_active_connections) by (backend)
+```
+
+**WS Connections Per Second**
+```promql
+sum(rate(ws_connections_total[1m])) by (status)
+```
+
+**WS Messages Per Second**
+```promql
+sum(rate(ws_messages_total[1m])) by (direction)
+```
+
+**WS P99 Connection Duration**
+```promql
+histogram_quantile(0.99, sum(rate(ws_connection_duration_seconds_bucket[1m])) by (le))
+```
+
+### Dashboard Features
+
+- **Auto-refresh**: Updates every 5 seconds
+- **Time range**: Last 15 minutes by default
+- **Templating**: Uses Prometheus datasource variable for easy switching
+- **Sections**: Organized into HTTP and WebSocket metrics
+
+## Useful Queries
+
+### Request Rate Analysis
+
+```promql
+# Total RPS
+sum(rate(rpc_requests_total[1m]))
+
+# RPS by RPC method
+sum(rate(rpc_requests_total[1m])) by (rpc_method)
+
+# RPS by client owner
+sum(rate(rpc_requests_total[1m])) by (owner)
+
+# Error rate (non-200 responses)
+sum(rate(rpc_requests_total{status!="200"}[1m]))
+```
+
+### Latency Analysis
+
+```promql
+# P50 latency
+histogram_quantile(0.50, sum(rate(rpc_request_duration_seconds_bucket[1m])) by (le))
+
+# P95 latency
+histogram_quantile(0.95, sum(rate(rpc_request_duration_seconds_bucket[1m])) by (le))
+
+# P99 latency
+histogram_quantile(0.99, sum(rate(rpc_request_duration_seconds_bucket[1m])) by (le))
+
+# P99 latency by backend
+histogram_quantile(0.99, sum(rate(rpc_request_duration_seconds_bucket[1m])) by (le, backend))
+```
+
+### Backend Health
+
+```promql
+# Current health status (1 = healthy, 0 = unhealthy)
+rpc_backend_health
+
+# Number of healthy backends
+sum(rpc_backend_health)
+
+# Backends that recently became unhealthy
+changes(rpc_backend_health[5m]) < 0
+```
+
+### WebSocket Monitoring
+
+```promql
+# Total active connections
+sum(ws_active_connections)
+
+# Active connections by backend
+sum(ws_active_connections) by (backend)
+
+# Connection rate by status
+sum(rate(ws_connections_total[1m])) by (status)
+
+# Failed connection rate
+sum(rate(ws_connections_total{status!="connected"}[1m]))
+
+# Message throughput
+sum(rate(ws_messages_total[1m]))
+
+# Average connection duration
+rate(ws_connection_duration_seconds_sum[1m]) / rate(ws_connection_duration_seconds_count[1m])
+```
+
+### Rate Limiting
+
+```promql
+# Rate of rate-limited requests (HTTP)
+sum(rate(rpc_requests_total{status="429"}[1m]))
+
+# Rate of rate-limited WebSocket connections
+sum(rate(ws_connections_total{status="rate_limited"}[1m]))
+
+# Rate-limited requests by owner
+sum(rate(rpc_requests_total{status="429"}[1m])) by (owner)
+```
+
+## Alerting
+
+### Prometheus Alert Rules
+
+Create `alerts.yml`:
+
+```yaml
+groups:
+  - name: sol_rpc_router
+    interval: 30s
+    rules:
+      # Backend health alerts
+      - alert: BackendUnhealthy
+        expr: rpc_backend_health == 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Backend {{ $labels.backend }} is unhealthy"
+          description: "Backend {{ $labels.backend }} has been unhealthy for 2 minutes"
+      
+      - alert: AllBackendsUnhealthy
+        expr: sum(rpc_backend_health) == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "All backends are unhealthy"
+          description: "No healthy backends available for routing"
+      
+      # Performance alerts
+      - alert: HighLatency
+        expr: histogram_quantile(0.99, sum(rate(rpc_request_duration_seconds_bucket[5m])) by (le)) > 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High P99 latency detected"
+          description: "P99 latency is {{ $value }}s (threshold: 5s)"
+      
+      - alert: HighErrorRate
+        expr: sum(rate(rpc_requests_total{status!="200"}[5m])) / sum(rate(rpc_requests_total[5m])) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High error rate detected"
+          description: "Error rate is {{ $value | humanizePercentage }} (threshold: 5%)"
+      
+      # Rate limiting alerts
+      - alert: HighRateLimitRate
+        expr: sum(rate(rpc_requests_total{status="429"}[5m])) > 10
+        for: 5m
+        labels:
+          severity: info
+        annotations:
+          summary: "High rate limiting activity"
+          description: "{{ $value }} requests/sec are being rate limited"
+```
+
+Add to `prometheus.yml`:
+
+```yaml
+rule_files:
+  - "alerts.yml"
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ['localhost:9093']
+```
+
+## Health Check Endpoint
+
+The router exposes a health check endpoint at `/health` that returns detailed backend status:
+
+```bash
+curl http://localhost:28899/health | jq
+```
+
+Example response:
+
+```json
+{
+  "overall_status": "healthy",
+  "backends": [
+    {
+      "label": "mainnet-primary",
+      "healthy": true,
+      "last_check": "SystemTime { tv_sec: 1234567890, tv_nsec: 0 }",
+      "consecutive_failures": 0,
+      "consecutive_successes": 15,
+      "last_error": null
+    },
+    {
+      "label": "backup-rpc",
+      "healthy": false,
+      "last_check": "SystemTime { tv_sec: 1234567890, tv_nsec: 0 }",
+      "consecutive_failures": 5,
+      "consecutive_successes": 0,
+      "last_error": "Health check timed out after 5s"
+    }
+  ]
+}
+```
+
+Use this endpoint for:
+- Load balancer health checks
+- Kubernetes liveness/readiness probes
+- External monitoring systems
+
+## Next Steps
+
+- [Configure hot reload](/operations/hot-reload) for configuration updates
+- [Troubleshoot issues](/operations/troubleshooting) using logs and metrics

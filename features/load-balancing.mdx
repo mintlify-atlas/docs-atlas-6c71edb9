@@ -1,0 +1,562 @@
+---
+title: 'Load Balancing'
+description: 'Weighted random backend selection with health-aware routing'
+---
+
+## Overview
+
+Sol RPC Router uses a **weighted random** algorithm to distribute requests across healthy backends. The selection logic filters out unhealthy backends and respects optional method-specific routing overrides.
+
+## Selection Algorithm
+
+### Weighted Random Selection
+
+Implementation in `src/state.rs:45-105`:
+
+```rust src/state.rs
+pub fn select_backend(&self, rpc_method: Option<&str>) -> Option<(String, String)> {
+    let state = self.state.load();
+
+    // Check method-specific routing first
+    if let Some(method) = rpc_method {
+        if let Some(backend_label) = state.method_routes.get(method) {
+            if let Some(backend) = state
+                .backends
+                .iter()
+                .find(|b| b.config.label == *backend_label)
+            {
+                if backend.healthy.load(Ordering::Relaxed) {
+                    debug!("Method {} routed to label={}", method, backend_label);
+                    return Some((backend.config.label.clone(), backend.config.url.clone()));
+                } else {
+                    info!(
+                        "Method {} target label={} is unhealthy, falling back to weighted selection",
+                        method, backend_label
+                    );
+                }
+            }
+        }
+    }
+
+    // Filter out unhealthy backends (lock-free)
+    let healthy_backends: Vec<&RuntimeBackend> = state
+        .backends
+        .iter()
+        .filter(|b| b.healthy.load(Ordering::Relaxed))
+        .collect();
+
+    if healthy_backends.is_empty() {
+        return None; // No healthy backends available
+    }
+
+    // Calculate total weight of healthy backends
+    let healthy_total_weight: u32 = healthy_backends.iter().map(|b| b.config.weight).sum();
+
+    if healthy_total_weight == 0 {
+        return healthy_backends
+            .first()
+            .map(|b| (b.config.label.clone(), b.config.url.clone()));
+    }
+
+    // Weighted random selection among healthy backends
+    let mut rng = rand::thread_rng();
+    let mut random_weight = rng.gen_range(0..healthy_total_weight);
+
+    for backend in &healthy_backends {
+        if random_weight < backend.config.weight {
+            return Some((backend.config.label.clone(), backend.config.url.clone()));
+        }
+        random_weight -= backend.config.weight;
+    }
+
+    // Fallback (should never reach here if weights are valid)
+    healthy_backends
+        .first()
+        .map(|b| (b.config.label.clone(), b.config.url.clone()))
+}
+```
+
+### How It Works
+
+<Steps>
+  <Step title="Method Routing Check">
+    If a method-specific route is configured and the backend is healthy, use it immediately:
+    
+    ```toml config.toml
+    [method_routes]
+    getSlot = "mainnet-primary"
+    ```
+    
+    If the target backend is unhealthy, fall through to weighted selection.
+  </Step>
+  
+  <Step title="Filter Healthy Backends">
+    Remove unhealthy backends from consideration:
+    
+    ```rust
+    let healthy_backends: Vec<&RuntimeBackend> = state
+        .backends
+        .iter()
+        .filter(|b| b.healthy.load(Ordering::Relaxed))
+        .collect();
+    ```
+    
+    Health status is checked atomically via `AtomicBool` without locks.
+  </Step>
+  
+  <Step title="Calculate Total Weight">
+    Sum weights of all healthy backends:
+    
+    ```rust
+    let healthy_total_weight: u32 = healthy_backends
+        .iter()
+        .map(|b| b.config.weight)
+        .sum();
+    ```
+    
+    If total weight is 0, return the first healthy backend.
+  </Step>
+  
+  <Step title="Random Selection">
+    Generate a random number in `[0, total_weight)` and walk through backends:
+    
+    ```rust
+    let mut rng = rand::thread_rng();
+    let mut random_weight = rng.gen_range(0..healthy_total_weight);
+
+    for backend in &healthy_backends {
+        if random_weight < backend.config.weight {
+            return Some((backend.config.label.clone(), backend.config.url.clone()));
+        }
+        random_weight -= backend.config.weight;
+    }
+    ```
+    
+    Each backend has a probability of `weight / total_weight` of being selected.
+  </Step>
+</Steps>
+
+## Weight Distribution
+
+### Example Configuration
+
+```toml config.toml
+[[backends]]
+label = "mainnet-primary"
+url = "https://api.mainnet-beta.solana.com"
+weight = 10
+
+[[backends]]
+label = "backup-rpc"
+url = "https://solana-api.com"
+weight = 5
+
+[[backends]]
+label = "local-node"
+url = "http://127.0.0.1:8899"
+weight = 2
+```
+
+### Traffic Distribution
+
+With all backends healthy, the expected traffic split is:
+
+| Backend | Weight | Probability | Approximate Traffic |
+|---------|--------|-------------|---------------------|
+| mainnet-primary | 10 | 10/17 | ~58.8% |
+| backup-rpc | 5 | 5/17 | ~29.4% |
+| local-node | 2 | 2/17 | ~11.8% |
+
+<Note>
+The weighted random algorithm provides **probabilistic** distribution. Over time, traffic converges to the expected ratios, but individual requests are randomly distributed.
+</Note>
+
+### Dynamic Rebalancing
+
+When a backend becomes unhealthy, traffic automatically redistributes:
+
+<CodeGroup>
+
+```text All Healthy
+Total weight: 10 + 5 + 2 = 17
+
+mainnet-primary: 10/17 = 58.8%
+backup-rpc:       5/17 = 29.4%
+local-node:       2/17 = 11.8%
+```
+
+```text mainnet-primary Unhealthy
+Total weight: 5 + 2 = 7
+
+backup-rpc:  5/7 = 71.4%
+local-node:  2/7 = 28.6%
+```
+
+```text Only local-node Healthy
+Total weight: 2
+
+local-node: 100%
+```
+
+</CodeGroup>
+
+## Method-Specific Routing
+
+### Configuration
+
+Pin specific RPC methods to designated backends:
+
+```toml config.toml
+[method_routes]
+getSlot = "mainnet-primary"
+getBlockHeight = "mainnet-primary"
+getTransaction = "archive-node"
+getSignaturesForAddress = "archive-node"
+```
+
+### Routing Behavior
+
+1. **Exact Match**: If the RPC method matches a route and the target backend is healthy, route directly
+2. **Fallback**: If the target backend is unhealthy, fall back to weighted selection
+3. **Unknown Methods**: Methods not in the routing table use weighted selection
+
+Example from `src/state.rs:49-67`:
+
+```rust src/state.rs
+if let Some(method) = rpc_method {
+    if let Some(backend_label) = state.method_routes.get(method) {
+        // Find the backend by label to check its atomic health
+        if let Some(backend) = state
+            .backends
+            .iter()
+            .find(|b| b.config.label == *backend_label)
+        {
+            if backend.healthy.load(Ordering::Relaxed) {
+                debug!("Method {} routed to label={}", method, backend_label);
+                return Some((backend.config.label.clone(), backend.config.url.clone()));
+            } else {
+                info!(
+                    "Method {} target label={} is unhealthy, falling back to weighted selection",
+                    method, backend_label
+                );
+            }
+        }
+    }
+}
+```
+
+<Warning>
+Method routing only applies to **healthy** backends. If the target backend is unhealthy, requests fall back to weighted selection across all healthy backends.
+</Warning>
+
+### Use Cases
+
+<AccordionGroup>
+  <Accordion title="Archive Node Routing">
+    Route historical queries to specialized archive nodes:
+    
+    ```toml
+    [[backends]]
+    label = "archive-node"
+    url = "https://archive.solana.com"
+    weight = 1
+    
+    [method_routes]
+    getTransaction = "archive-node"
+    getConfirmedBlock = "archive-node"
+    ```
+  </Accordion>
+  
+  <Accordion title="High-Performance Endpoints">
+    Pin latency-sensitive methods to low-latency backends:
+    
+    ```toml
+    [[backends]]
+    label = "local-validator"
+    url = "http://127.0.0.1:8899"
+    weight = 1
+    
+    [method_routes]
+    sendTransaction = "local-validator"
+    simulateTransaction = "local-validator"
+    ```
+  </Accordion>
+  
+  <Accordion title="Cost Optimization">
+    Route expensive queries to cheaper providers:
+    
+    ```toml
+    [[backends]]
+    label = "budget-rpc"
+    url = "https://cheap-rpc.example.com"
+    weight = 1
+    
+    [method_routes]
+    getSignaturesForAddress = "budget-rpc"
+    getProgramAccounts = "budget-rpc"
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## WebSocket Load Balancing
+
+### Separate Selection Logic
+
+WebSocket connections use a dedicated selection function (src/state.rs:108-146):
+
+```rust src/state.rs
+pub fn select_ws_backend(&self) -> Option<(String, String)> {
+    let state = self.state.load();
+
+    // Filter to backends with ws_url configured and healthy (lock-free)
+    let ws_backends: Vec<&RuntimeBackend> = state
+        .backends
+        .iter()
+        .filter(|b| b.config.ws_url.is_some() && b.healthy.load(Ordering::Relaxed))
+        .collect();
+
+    if ws_backends.is_empty() {
+        return None;
+    }
+
+    // Calculate total weight of WebSocket-capable backends
+    let total_weight: u32 = ws_backends.iter().map(|b| b.config.weight).sum();
+
+    // Weighted random selection
+    let mut rng = rand::thread_rng();
+    let mut random_weight = rng.gen_range(0..total_weight);
+
+    for backend in &ws_backends {
+        if random_weight < backend.config.weight {
+            return Some((
+                backend.config.label.clone(),
+                backend.config.ws_url.as_ref().unwrap().clone(),
+            ));
+        }
+        random_weight -= backend.config.weight;
+    }
+
+    // Fallback
+    ws_backends.first().map(|b| (
+        b.config.label.clone(),
+        b.config.ws_url.as_ref().unwrap().clone(),
+    ))
+}
+```
+
+### Key Differences
+
+1. **ws_url Required**: Only backends with `ws_url` configured are considered
+2. **No Method Routing**: WebSocket connections don't use method-specific routing
+3. **Same Weights**: Uses the same weight values as HTTP routing
+
+### Configuration
+
+```toml config.toml
+[[backends]]
+label = "mainnet-primary"
+url = "https://api.mainnet-beta.solana.com"
+ws_url = "wss://api.mainnet-beta.solana.com"  # WebSocket enabled
+weight = 10
+
+[[backends]]
+label = "http-only-backend"
+url = "https://http-only.example.com"
+# No ws_url - excluded from WebSocket routing
+weight = 5
+```
+
+<Check>
+Backends without `ws_url` continue to serve HTTP requests but are automatically excluded from WebSocket routing.
+</Check>
+
+## Health-Aware Routing
+
+### Lock-Free Health Checks
+
+Backend health status is stored in `AtomicBool` for lock-free access:
+
+```rust src/state.rs
+#[derive(Debug, Clone)]
+pub struct RuntimeBackend {
+    pub config: Backend,
+    pub healthy: Arc<AtomicBool>,
+}
+```
+
+Selection reads health status without blocking:
+
+```rust src/state.rs
+let healthy_backends: Vec<&RuntimeBackend> = state
+    .backends
+    .iter()
+    .filter(|b| b.healthy.load(Ordering::Relaxed))
+    .collect();
+```
+
+### Automatic Exclusion
+
+Unhealthy backends are automatically excluded from selection:
+
+1. Background health checker marks backends unhealthy
+2. Next request filters out unhealthy backends
+3. Traffic redistributes to remaining healthy backends
+4. When backend recovers, traffic gradually returns
+
+<Note>
+Health transitions are atomic and immediate. There's no delay between a backend being marked unhealthy and being excluded from routing.
+</Note>
+
+### No Healthy Backends
+
+If all backends are unhealthy, requests fail with `503 Service Unavailable`:
+
+```rust src/handlers.rs
+let (backend_label, backend_url) = match state.select_backend(rpc_method) {
+    Some(selection) => selection,
+    None => {
+        tracing::error!("No healthy backends available for request");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "No healthy backends available",
+        )
+            .into_response();
+    }
+};
+```
+
+See [Health Checks](/configuration/health-checks) for details on health monitoring.
+
+## Configuration Reference
+
+### Backend Definition
+
+```toml config.toml
+[[backends]]
+label = "backend-name"        # Unique identifier
+url = "https://rpc.example.com" # HTTP endpoint
+ws_url = "wss://rpc.example.com" # WebSocket endpoint (optional)
+weight = 10                     # Relative traffic weight (must be > 0)
+```
+
+### Method Routing
+
+```toml config.toml
+[method_routes]
+method_name = "backend-label"  # Must match an existing backend label
+```
+
+### Validation Rules
+
+Configuration is validated at startup (src/config.rs):
+
+<Tabs>
+  <Tab title="Backend Validation">
+    - At least one backend required
+    - Labels must be unique and non-empty
+    - Weights must be > 0
+    - URLs must be valid HTTP(S) endpoints
+  </Tab>
+  
+  <Tab title="Method Route Validation">
+    - Route targets must reference existing backend labels
+    - Invalid labels cause startup failure
+  </Tab>
+</Tabs>
+
+<Warning>
+Invalid configuration causes the router to exit with an error at startup. Always test configuration changes with `--config` flag before deploying.
+</Warning>
+
+## Monitoring Load Distribution
+
+### Metrics Labels
+
+All request metrics include the `backend` label:
+
+```promql
+# Total requests per backend
+sum by (backend) (rpc_requests_total)
+
+# Request rate per backend
+rate(rpc_requests_total{backend="mainnet-primary"}[5m])
+
+# Traffic distribution (percentage)
+sum by (backend) (rate(rpc_requests_total[5m])) 
+  / ignoring(backend) group_left
+sum(rate(rpc_requests_total[5m]))
+```
+
+### Grafana Dashboard Queries
+
+<CodeGroup>
+
+```promql Request Distribution
+sum by (backend) (rate(rpc_requests_total[5m]))
+```
+
+```promql Backend Health
+backend_healthy{}
+```
+
+```promql Weighted Traffic Ratio
+sum by (backend) (rate(rpc_requests_total[5m])) 
+  / on(backend) backend_weight
+```
+
+</CodeGroup>
+
+See [Metrics](/features/metrics) for the complete list of available metrics.
+
+## Hot Reload
+
+Backend configuration can be reloaded without downtime:
+
+```bash
+# Update config.toml
+vim config.toml
+
+# Send SIGHUP to reload
+kill -HUP $(pidof sol-rpc-router)
+```
+
+The reload process (src/main.rs:133-191):
+
+1. Reloads `config.toml`
+2. Validates new configuration
+3. Preserves health status for matching backend labels
+4. Atomically swaps routing state
+5. New requests use updated configuration
+
+<Check>
+In-flight requests complete with the old configuration. Only new requests use the reloaded backends and weights.
+</Check>
+
+## Performance Considerations
+
+<AccordionGroup>
+  <Accordion title="Selection Overhead">
+    Backend selection runs on every request:
+    - Lock-free atomic health checks
+    - O(n) iteration over backends
+    - RNG generation per request
+    
+    With typical backend counts (2-10), overhead is negligible (&lt;1μs).
+  </Accordion>
+  
+  <Accordion title="Weight Precision">
+    Weights are `u32` values supporting:
+    - Fine-grained ratios (e.g., 1000:1)
+    - Large weight values without overflow
+    - Total weight limit: 4,294,967,295
+  </Accordion>
+  
+  <Accordion title="Random Distribution">
+    The algorithm uses `rand::thread_rng()` for randomness:
+    - Thread-local RNG (no contention)
+    - Cryptographically insecure (fast)
+    - Uniform distribution over time
+    
+    For more deterministic distribution, consider round-robin alternatives.
+  </Accordion>
+</AccordionGroup>

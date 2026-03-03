@@ -1,0 +1,279 @@
+---
+title: 'rpc-admin CLI'
+description: 'Command-line tool for managing API keys in Redis'
+---
+
+`rpc-admin` is a command-line utility for managing API keys used by sol-rpc-router. All keys are stored in Redis and support per-key rate limiting, owner tracking, and active/inactive status.
+
+## Global Options
+
+<ParamField path="--redis-url" type="string" default="redis://127.0.0.1:6379">
+  Redis connection URL. Can also be set via `REDIS_URL` environment variable.
+  
+  ```bash
+  rpc-admin --redis-url redis://localhost:6379/0 list
+  ```
+</ParamField>
+
+## Commands
+
+### create
+
+Create a new API key with configurable rate limits and optional expiration.
+
+```bash
+rpc-admin create <owner> [OPTIONS]
+```
+
+<ParamField path="owner" type="string" required>
+  Owner identifier for the key (e.g., `client-name`, `project-id`). Used for tracking and metrics.
+</ParamField>
+
+<ParamField path="--rate-limit" type="number" default="10">
+  Rate limit in requests per second (RPS).
+</ParamField>
+
+<ParamField path="--expires-at" type="number">
+  Expiration timestamp (Unix epoch seconds). Optional.
+</ParamField>
+
+<ParamField path="--key" type="string">
+  Custom API key value. If omitted, a random 32-character alphanumeric key is generated.
+</ParamField>
+
+#### Examples
+
+```bash
+# Create key with default rate limit (10 RPS)
+rpc-admin create my-client
+
+# Create key with custom rate limit
+rpc-admin create my-client --rate-limit 50
+
+# Create key with expiration (expires at 2025-12-31 23:59:59 UTC)
+rpc-admin create my-client --rate-limit 100 --expires-at 1735689599
+
+# Create key with custom value
+rpc-admin create my-client --rate-limit 10 --key my-custom-key-12345
+```
+
+#### Output
+
+```bash
+Created API key for my-client:
+aBcDeFgHiJkLmNoPqRsTuVwXyZ123456
+```
+
+#### Redis Storage
+
+Keys are stored as Redis hashes with the following structure:
+
+```redis
+HSET api_key:aBcDeFgHiJkLmNoPqRsTuVwXyZ123456
+  owner "my-client"
+  rate_limit 10
+  created_at 1709481600
+  active "true"
+  expires_at 1735689599  # optional
+
+SADD api_keys_index aBcDeFgHiJkLmNoPqRsTuVwXyZ123456
+```
+
+---
+
+### list
+
+List all API keys with owner and active status.
+
+```bash
+rpc-admin list
+```
+
+#### Example Output
+
+```bash
+Found 3 keys:
+- aBcDeFgHiJkLmNoPqRsTuVwXyZ123456 [owner=my-client] [active=true]
+- xYz789AbCdEfGhIjKlMnOpQrStUvWx12 [owner=project-alpha] [active=true]
+- qWeRtYuIoPaSdFgHjKlZxCvBnM987654 [owner=old-client] [active=false]
+```
+
+---
+
+### inspect
+
+View detailed information about a specific API key.
+
+```bash
+rpc-admin inspect <key>
+```
+
+<ParamField path="key" type="string" required>
+  The API key to inspect.
+</ParamField>
+
+#### Example
+
+```bash
+rpc-admin inspect aBcDeFgHiJkLmNoPqRsTuVwXyZ123456
+```
+
+#### Output
+
+```bash
+Key: aBcDeFgHiJkLmNoPqRsTuVwXyZ123456
+Owner: my-client
+Active: true
+Rate Limit: 50 RPS
+Created At: 1709481600
+```
+
+If the key doesn't exist:
+
+```bash
+Key not found
+```
+
+---
+
+### revoke
+
+Revoke an API key by marking it as inactive. The key remains in Redis but authentication will fail.
+
+```bash
+rpc-admin revoke <key>
+```
+
+<ParamField path="key" type="string" required>
+  The API key to revoke.
+</ParamField>
+
+#### Example
+
+```bash
+rpc-admin revoke aBcDeFgHiJkLmNoPqRsTuVwXyZ123456
+```
+
+#### Output
+
+```bash
+Revoked key: aBcDeFgHiJkLmNoPqRsTuVwXyZ123456
+```
+
+Or if the key doesn't exist:
+
+```bash
+Key not found: aBcDeFgHiJkLmNoPqRsTuVwXyZ123456
+```
+
+#### Implementation Details
+
+Revocation sets the `active` field to `"false"` in Redis:
+
+```redis
+HSET api_key:aBcDeFgHiJkLmNoPqRsTuVwXyZ123456 active "false"
+```
+
+The key remains in the `api_keys_index` set and can be reactivated using the `update` command.
+
+---
+
+### update
+
+Update properties of an existing API key.
+
+```bash
+rpc-admin update <key> [OPTIONS]
+```
+
+<ParamField path="key" type="string" required>
+  The API key to update.
+</ParamField>
+
+<ParamField path="--rate-limit" type="number">
+  New rate limit in requests per second.
+</ParamField>
+
+<ParamField path="--owner" type="string">
+  New owner identifier.
+</ParamField>
+
+<ParamField path="--active" type="boolean">
+  Set to `true` to activate or `false` to deactivate the key.
+</ParamField>
+
+#### Examples
+
+```bash
+# Update rate limit
+rpc-admin update aBcDeFgHiJkLmNoPqRsTuVwXyZ123456 --rate-limit 100
+
+# Reactivate a revoked key
+rpc-admin update aBcDeFgHiJkLmNoPqRsTuVwXyZ123456 --active true
+
+# Update owner name
+rpc-admin update aBcDeFgHiJkLmNoPqRsTuVwXyZ123456 --owner new-client-name
+
+# Update multiple properties
+rpc-admin update aBcDeFgHiJkLmNoPqRsTuVwXyZ123456 --rate-limit 100 --active true
+```
+
+#### Output
+
+```bash
+Updated key: aBcDeFgHiJkLmNoPqRsTuVwXyZ123456
+  rate_limit -> 100
+  active -> true
+```
+
+If no options are provided:
+
+```bash
+No changes requested for key: aBcDeFgHiJkLmNoPqRsTuVwXyZ123456
+```
+
+If the key doesn't exist:
+
+```bash
+Key not found: aBcDeFgHiJkLmNoPqRsTuVwXyZ123456
+```
+
+---
+
+## Environment Variables
+
+<ParamField path="REDIS_URL" type="string" default="redis://127.0.0.1:6379">
+  Alternative to `--redis-url` flag. The flag takes precedence if both are set.
+  
+  ```bash
+  export REDIS_URL="redis://localhost:6379/0"
+  rpc-admin list
+  ```
+</ParamField>
+
+---
+
+## Redis Key Schema
+
+### API Key Hash
+
+Each API key is stored as a Redis hash at `api_key:<key_value>`:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `owner` | string | Owner identifier |
+| `rate_limit` | number | Requests per second limit |
+| `created_at` | number | Unix timestamp of creation |
+| `active` | string | `"true"` or `"false"` |
+| `expires_at` | number | Optional Unix timestamp |
+
+### Index Set
+
+All keys are tracked in a Redis set:
+
+```redis
+SMEMBERS api_keys_index
+# Returns: ["key1", "key2", "key3", ...]
+```
+
+This set is used by the `list` command to enumerate all keys efficiently.

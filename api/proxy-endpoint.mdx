@@ -1,0 +1,260 @@
+---
+title: 'JSON-RPC Proxy Endpoints'
+description: 'Forward JSON-RPC requests to backend Solana RPC nodes with authentication and load balancing'
+---
+
+## POST /
+
+Proxy JSON-RPC requests to backend Solana RPC nodes. The router authenticates requests via API key, selects a healthy backend using weighted load balancing or method-based routing, and forwards the request.
+
+### Authentication
+
+All proxy requests require an API key passed as a query parameter:
+
+```bash
+POST /?api-key=YOUR_API_KEY
+```
+
+The API key is validated against Redis and checked against per-key rate limits before forwarding.
+
+### Request
+
+<ParamField body="jsonrpc" type="string" required>
+  JSON-RPC version (must be `"2.0"`)
+</ParamField>
+
+<ParamField body="id" type="number | string" required>
+  Request identifier
+</ParamField>
+
+<ParamField body="method" type="string" required>
+  Solana RPC method name (e.g., `getAccountInfo`, `getSlot`, `sendTransaction`)
+</ParamField>
+
+<ParamField body="params" type="array">
+  Method-specific parameters
+</ParamField>
+
+### Response
+
+The response format matches the Solana JSON-RPC specification. Successful backend responses are proxied transparently:
+
+<ResponseField name="jsonrpc" type="string">
+  JSON-RPC version (`"2.0"`)
+</ResponseField>
+
+<ResponseField name="id" type="number | string">
+  Request identifier (matches request)
+</ResponseField>
+
+<ResponseField name="result" type="any">
+  Method-specific result data from the backend
+</ResponseField>
+
+<ResponseField name="error" type="object">
+  Error object (only present if backend returned an error)
+  
+  <Expandable title="properties">
+    <ResponseField name="code" type="number">
+      JSON-RPC error code
+    </ResponseField>
+    
+    <ResponseField name="message" type="string">
+      Human-readable error message
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+### Error Responses
+
+<ResponseField name="401 Unauthorized" type="string">
+  Returned when:
+  - No `api-key` query parameter provided
+  - Invalid API key
+  - API key is inactive (`active=false` in Redis)
+  
+  Response body: `"Unauthorized"`
+</ResponseField>
+
+<ResponseField name="429 Too Many Requests" type="string">
+  Returned when the API key exceeds its configured rate limit (RPS).
+  
+  Response body: `"Rate limit exceeded"`
+</ResponseField>
+
+<ResponseField name="500 Internal Server Error" type="string">
+  Returned when:
+  - Redis connection error during key validation
+  - Invalid backend URI configuration
+  
+  Response body: `"Internal Server Error"` or `"Invalid backend configuration"`
+</ResponseField>
+
+<ResponseField name="502 Bad Gateway" type="string">
+  Returned when the backend request fails (network error, invalid response, etc.).
+  
+  Response body: `"Proxy error: {error_details}"`
+</ResponseField>
+
+<ResponseField name="503 Service Unavailable" type="string">
+  Returned when no healthy backends are available to handle the request.
+  
+  Response body: `"No healthy backends available"`
+</ResponseField>
+
+<ResponseField name="504 Gateway Timeout" type="string">
+  Returned when the backend request exceeds the configured timeout (default 30s).
+  
+  Response body: `"Upstream request timed out after {timeout}s"`
+</ResponseField>
+
+### Backend Selection
+
+The router selects backends using this priority:
+
+1. **Method-based routing**: If the `method` field matches a configured route (e.g., `getSlot -> mainnet-primary`), that backend is used if healthy
+2. **Weighted load balancing**: Randomly selects from healthy backends using configured weights
+3. **Fallback**: Returns 503 if no healthy backends are available
+
+### Request Examples
+
+<CodeGroup>
+
+```bash Basic RPC Call
+curl -X POST "https://rpc.example.com/?api-key=YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "getSlot",
+    "params": []
+  }'
+```
+
+```bash Get Account Info
+curl -X POST "https://rpc.example.com/?api-key=YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "getAccountInfo",
+    "params": [
+      "vines1vzrYbzLMRdu58ou5XTby4qAqVRLmqo36NKPTg",
+      {"encoding": "base64"}
+    ]
+  }'
+```
+
+```bash Send Transaction
+curl -X POST "https://rpc.example.com/?api-key=YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "sendTransaction",
+    "params": [
+      "4hXTCkRzt9WyecNzV1XPgCDfGAZzQKNxLXgynz5QDuWWPSAZBZSHptvWRL3BjCvzUXRdKvHL2b7yGrRQcWyaqsaBCncVG7BFggS8w9snUts67BSh3EqKpXLUm5UMHfD7ZBe9GhARjbNQMLJ1QD3Spr6oMTBU6EhdB4RD8CP2xUxr2u3d6fos36PD98XS6oX8TQjLpsMwncs5DAMiD4nNnR8NBfyghGCWvCVifVwvA8B8TJxE1aiyiv2L429BCWfyzAme5sZW8rDb14NeCQHhZbtNqfXhcp2tAnaAT"
+    ]
+  }'
+```
+
+</CodeGroup>
+
+### Response Examples
+
+<CodeGroup>
+
+```json Success Response
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": 123456789
+}
+```
+
+```json Backend Error
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "error": {
+    "code": -32602,
+    "message": "Invalid params: invalid length 1, expected a tuple of size 2"
+  }
+}
+```
+
+```text Unauthorized
+Unauthorized
+```
+
+```text Rate Limited
+Rate limit exceeded
+```
+
+```text No Backends
+No healthy backends available
+```
+
+</CodeGroup>
+
+---
+
+## POST /*path
+
+Proxy JSON-RPC requests with a custom path. This endpoint forwards requests to `{backend_url}{path}?{query_params}` while stripping the `api-key` parameter.
+
+### Path Parameters
+
+<ParamField path="path" type="string">
+  Custom path to append to the backend URL (e.g., `/v1/mainnet`)
+</ParamField>
+
+### Authentication
+
+Same as `POST /` - requires `?api-key=YOUR_API_KEY` query parameter.
+
+### Request/Response
+
+Identical to `POST /` endpoint. The only difference is the path forwarding behavior.
+
+### Path Handling
+
+The router constructs the backend URL as:
+
+- Request: `POST /v1/mainnet?api-key=abc123&commitment=finalized`
+- Backend: `{backend_url}/v1/mainnet?commitment=finalized`
+
+The `api-key` parameter is stripped before forwarding.
+
+### Example
+
+```bash Custom Path
+curl -X POST "https://rpc.example.com/v1/mainnet?api-key=YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "getHealth"
+  }'
+```
+
+### Rate Limiting
+
+Both `POST /` and `POST /*path` share the same rate limit counter per API key. Rate limits are enforced atomically in Redis using a Lua script:
+
+1. Increment `rate_limit:{api_key}` counter
+2. Set 1-second TTL if this is the first request in the window
+3. Compare count against the key's configured `rate_limit`
+4. Return 429 if limit exceeded
+
+### Timeout Behavior
+
+Backend requests timeout after the configured `proxy.timeout_secs` (default 30s). When a timeout occurs:
+
+- Status: `504 Gateway Timeout`
+- Response: `"Upstream request timed out after {timeout}s"`
+- Metrics: Request is logged with backend label and timeout status
+
+### Host Header
+
+The router automatically updates the `Host` header to match the selected backend, ensuring proper routing through CDNs and reverse proxies.

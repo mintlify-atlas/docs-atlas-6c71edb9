@@ -1,80 +1,341 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+title: Quick Start
+description: Get Sol RPC Router up and running in 5 minutes
 ---
 
-## Get started in three steps
+## Overview
 
-Get your documentation site running locally and make your first customization.
-
-### Step 1: Set up your local environment
-
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
-
-### Step 2: Deploy your changes
-
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
-
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
-
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
-
-### Step 3: Go live
-
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
-
-## Next steps
-
-Now that you have your docs running, explore these key features:
-
-<CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
-</CardGroup>
+This guide will walk you through setting up Sol RPC Router from scratch. You'll learn how to build the router, configure Redis, set up backend endpoints, create API keys, and make your first authenticated request.
 
 <Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
+  **Prerequisites**: Make sure you have Rust (2021 edition) and Redis installed. See the [Installation guide](/installation) for detailed setup instructions.
 </Note>
+
+## Quick Setup
+
+<Steps>
+  <Step title="Clone and Build">
+    Build Sol RPC Router from source:
+
+    ```bash
+    git clone https://github.com/glamsystems/sol-rpc-router
+    cd sol-rpc-router
+    cargo build --release
+    ```
+
+    This will create two binaries:
+    - `./target/release/sol-rpc-router` - The main proxy server
+    - `./target/release/rpc-admin` - The API key management CLI
+
+    <Tip>
+      The release build is optimized for production use. For development, you can use `cargo build` (without `--release`) for faster compilation.
+    </Tip>
+  </Step>
+
+  <Step title="Start Redis">
+    Sol RPC Router requires Redis for API key storage and rate limiting:
+
+    ```bash
+    # Using Docker
+    docker run -d -p 6379:6379 redis:7-alpine
+
+    # Or using a local Redis installation
+    redis-server
+    ```
+
+    Verify Redis is running:
+
+    ```bash
+    redis-cli ping
+    # Should return: PONG
+    ```
+  </Step>
+
+  <Step title="Configure the Router">
+    Create a `config.toml` file based on the example:
+
+    ```bash
+    cp config.example.toml config.toml
+    ```
+
+    Here's a minimal configuration to get started:
+
+    ```toml config.toml
+    port = 28899
+    metrics_port = 28901
+    redis_url = "redis://127.0.0.1:6379/0"
+
+    [[backends]]
+    label = "mainnet-primary"
+    url = "https://api.mainnet-beta.solana.com"
+    weight = 10
+    ws_url = "wss://api.mainnet-beta.solana.com"
+
+    [[backends]]
+    label = "backup-rpc"
+    url = "https://solana-api.com"
+    weight = 5
+
+    [proxy]
+    timeout_secs = 30
+
+    [health_check]
+    interval_secs = 30
+    timeout_secs = 5
+    method = "getSlot"
+    consecutive_failures_threshold = 3
+    consecutive_successes_threshold = 2
+
+    [method_routes]
+    getSlot = "mainnet-primary"
+    ```
+
+    <Info>
+      **Configuration Details**:
+      - `port`: HTTP server listens here. WebSocket automatically uses `port + 1`
+      - `weight`: Higher values receive more traffic (10:5 = 2:1 distribution)
+      - `ws_url`: Optional WebSocket endpoint for subscriptions
+      - `method_routes`: Pin specific RPC methods to backends
+    </Info>
+  </Step>
+
+  <Step title="Start the Router">
+    Launch the router with your configuration:
+
+    ```bash
+    ./target/release/sol-rpc-router --config config.toml
+    ```
+
+    You should see output like:
+
+    ```
+    Loaded configuration from: config.toml
+    Redis URL configured (host redacted)
+    Loaded 2 backends
+      - [mainnet-primary] https://api.mainnet-beta.solana.com (weight: 10)
+      - [backup-rpc] https://solana-api.com (weight: 5)
+    Method routing overrides:
+      - getSlot -> mainnet-primary
+    HTTP server listening on http://0.0.0.0:28899
+    WebSocket server listening on ws://0.0.0.0:28900
+    Metrics server listening on http://0.0.0.0:28901
+    Health monitoring endpoint: http://0.0.0.0:28899/health
+    Starting health check loop
+    ```
+  </Step>
+
+  <Step title="Create an API Key">
+    Use the `rpc-admin` CLI to create your first API key:
+
+    ```bash
+    ./target/release/rpc-admin create my-client --rate-limit 50
+    ```
+
+    Output:
+    ```
+    Created API key for my-client:
+    a7f3K9mN2pQ5sT8vX1wY4zB6cD0eF3gH
+    ```
+
+    <Tip>
+      The API key is automatically generated as a 32-character alphanumeric string. You can also specify a custom key using `--key your-custom-key`.
+    </Tip>
+
+    **Common rpc-admin commands**:
+
+    <CodeGroup>
+    ```bash List All Keys
+    ./target/release/rpc-admin list
+    ```
+
+    ```bash Inspect a Key
+    ./target/release/rpc-admin inspect <api_key>
+    ```
+
+    ```bash Update Rate Limit
+    ./target/release/rpc-admin update <api_key> --rate-limit 100
+    ```
+
+    ```bash Revoke a Key
+    ./target/release/rpc-admin revoke <api_key>
+    ```
+    </CodeGroup>
+  </Step>
+
+  <Step title="Make Your First Request">
+    Test the router with a JSON-RPC request:
+
+    ```bash
+    curl -X POST http://localhost:28899/?api-key=a7f3K9mN2pQ5sT8vX1wY4zB6cD0eF3gH \
+      -H "Content-Type: application/json" \
+      -d '{
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getSlot"
+      }'
+    ```
+
+    Expected response:
+    ```json
+    {
+      "jsonrpc": "2.0",
+      "result": 123456789,
+      "id": 1
+    }
+    ```
+
+    <Warning>
+      **Authentication Required**: All requests must include `?api-key=` as a query parameter. Requests without a valid API key will receive a `401 Unauthorized` response.
+    </Warning>
+  </Step>
+</Steps>
+
+## Test WebSocket Connections
+
+Sol RPC Router supports WebSocket subscriptions on both the main HTTP port (via upgrade) and a dedicated WebSocket port:
+
+<CodeGroup>
+```bash Main Port (Upgrade)
+wscat -c "ws://localhost:28899/?api-key=a7f3K9mN2pQ5sT8vX1wY4zB6cD0eF3gH"
+```
+
+```bash Dedicated WebSocket Port
+wscat -c "ws://localhost:28900/?api-key=a7f3K9mN2pQ5sT8vX1wY4zB6cD0eF3gH"
+```
+</CodeGroup>
+
+Send a subscription request:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "slotSubscribe"
+}
+```
+
+## Monitor Health and Metrics
+
+Check backend health status:
+
+```bash
+curl http://localhost:28899/health
+```
+
+Response:
+```json
+{
+  "backends": [
+    {
+      "label": "mainnet-primary",
+      "healthy": true,
+      "consecutive_failures": 0,
+      "consecutive_successes": 5,
+      "last_check": "2026-03-03T10:30:45Z",
+      "last_error": null
+    },
+    {
+      "label": "backup-rpc",
+      "healthy": true,
+      "consecutive_failures": 0,
+      "consecutive_successes": 5,
+      "last_check": "2026-03-03T10:30:45Z",
+      "last_error": null
+    }
+  ]
+}
+```
+
+View Prometheus metrics:
+
+```bash
+curl http://localhost:28901/metrics
+```
+
+## Rate Limiting in Action
+
+Test the rate limiter by exceeding your configured limit:
+
+```bash
+# Create a key with a very low limit
+./target/release/rpc-admin create test-client --rate-limit 2
+
+# Make 3 rapid requests (the 3rd should be rate limited)
+for i in {1..3}; do
+  curl -X POST "http://localhost:28899/?api-key=<your-key>" \
+    -H "Content-Type: application/json" \
+    -d '{"jsonrpc":"2.0","id":1,"method":"getSlot"}'
+  echo ""
+done
+```
+
+The third request will return:
+```json
+{
+  "error": "Rate limit exceeded"
+}
+```
+with HTTP status `429 Too Many Requests`.
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Configuration Guide" icon="sliders" href="/configuration/overview">
+    Learn about advanced configuration options, method routing, and health checks
+  </Card>
+  
+  <Card title="API Reference" icon="code" href="/api/rpc-admin">
+    Complete endpoint documentation and request/response examples
+  </Card>
+  
+  <Card title="Deployment" icon="server" href="/operations/deployment">
+    Production deployment strategies, monitoring, and best practices
+  </Card>
+  
+  <Card title="Metrics & Monitoring" icon="chart-line" href="/operations/monitoring">
+    Set up Prometheus and Grafana dashboards for your router
+  </Card>
+</CardGroup>
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Redis connection failed">
+    **Error**: `Failed to initialize Redis KeyStore`
+
+    **Solutions**:
+    - Verify Redis is running: `redis-cli ping`
+    - Check the `redis_url` in your config.toml
+    - Ensure Redis is accessible on the configured port
+    - Check firewall rules if Redis is on a remote host
+  </Accordion>
+
+  <Accordion title="401 Unauthorized">
+    **Error**: All requests return `401 Unauthorized`
+
+    **Solutions**:
+    - Ensure you're passing `?api-key=` as a query parameter
+    - Verify the API key exists: `./target/release/rpc-admin inspect <key>`
+    - Check that the key is active: `active` should be `true`
+    - Confirm Redis is running and accessible
+  </Accordion>
+
+  <Accordion title="Backend connection errors">
+    **Error**: `Failed to connect to backend`
+
+    **Solutions**:
+    - Verify backend URLs are correct in config.toml
+    - Test backend connectivity: `curl <backend_url>`
+    - Check the `/health` endpoint for backend status
+    - Review `health_check.method` - ensure the RPC method is supported
+  </Accordion>
+
+  <Accordion title="All backends marked unhealthy">
+    **Solutions**:
+    - Check `/health` endpoint for error details
+    - Verify `health_check.method` is a valid RPC method (e.g., `getSlot`)
+    - Increase `health_check.timeout_secs` if backends are slow
+    - Review backend logs for errors
+    - Test backends directly with curl
+  </Accordion>
+</AccordionGroup>

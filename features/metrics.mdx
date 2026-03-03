@@ -1,0 +1,877 @@
+---
+title: 'Metrics & Monitoring'
+description: 'Prometheus metrics, Grafana dashboards, and observability'
+---
+
+## Overview
+
+Sol RPC Router exposes Prometheus-compatible metrics at `/metrics` for comprehensive monitoring of request performance, backend health, WebSocket connections, and API key usage.
+
+## Metrics Endpoint
+
+Metrics are served on a dedicated port (default 9091):
+
+```bash
+curl http://localhost:9091/metrics
+```
+
+Configuration in `config.toml`:
+
+```toml config.toml
+metrics_port = 9091
+```
+
+### Prometheus Configuration
+
+The router initializes Prometheus with histogram buckets optimized for RPC latencies (src/main.rs:38-45):
+
+```rust src/main.rs
+let builder = PrometheusBuilder::new()
+    .set_buckets(&[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0])
+    .expect("failed to set histogram buckets");
+let handle = builder
+    .install_recorder()
+    .expect("failed to install Prometheus recorder");
+```
+
+**Histogram Buckets** (in seconds):
+- `0.001` (1ms) to `10.0` (10s)
+- Enables accurate percentile calculations with `histogram_quantile()`
+- Covers typical RPC latencies from fast reads to slow historical queries
+
+## HTTP Request Metrics
+
+### rpc_request_duration_seconds
+
+**Type**: Histogram  
+**Labels**: `rpc_method`, `backend`, `owner`
+
+Tracks request duration from receipt to response.
+
+Implementation in `src/handlers.rs:134`:
+
+```rust src/handlers.rs
+histogram!("rpc_request_duration_seconds", 
+    "rpc_method" => rpc_method.clone(), 
+    "backend" => backend.clone(), 
+    "owner" => owner.clone())
+    .record(duration);
+```
+
+**Example Queries**:
+
+<CodeGroup>
+
+```promql Average Latency
+# Average latency per backend
+rate(rpc_request_duration_seconds_sum[5m])
+  / rate(rpc_request_duration_seconds_count[5m])
+
+# Average latency per RPC method
+rate(rpc_request_duration_seconds_sum{rpc_method="getSlot"}[5m])
+  / rate(rpc_request_duration_seconds_count{rpc_method="getSlot"}[5m])
+```
+
+```promql Percentiles
+# 95th percentile latency
+histogram_quantile(0.95, 
+  sum by (le, backend) (
+    rate(rpc_request_duration_seconds_bucket[5m])
+  )
+)
+
+# 99th percentile per method
+histogram_quantile(0.99,
+  sum by (le, rpc_method) (
+    rate(rpc_request_duration_seconds_bucket[5m])
+  )
+)
+```
+
+```promql By Owner
+# Latency per API key owner
+rate(rpc_request_duration_seconds_sum{owner="my-client"}[5m])
+  / rate(rpc_request_duration_seconds_count{owner="my-client"}[5m])
+```
+
+</CodeGroup>
+
+### rpc_requests_total
+
+**Type**: Counter  
+**Labels**: `method`, `status`, `rpc_method`, `backend`, `owner`
+
+Counts all requests with HTTP method, status code, RPC method, backend, and owner.
+
+Implementation in `src/handlers.rs:135`:
+
+```rust src/handlers.rs
+counter!("rpc_requests_total", 
+    "method" => method, 
+    "status" => status, 
+    "rpc_method" => rpc_method, 
+    "backend" => backend, 
+    "owner" => owner)
+    .increment(1);
+```
+
+**Example Queries**:
+
+<CodeGroup>
+
+```promql Request Rate
+# Total requests per second
+sum(rate(rpc_requests_total[5m]))
+
+# Requests per backend
+sum by (backend) (rate(rpc_requests_total[5m]))
+
+# Requests per RPC method
+sum by (rpc_method) (rate(rpc_requests_total[5m]))
+```
+
+```promql Error Rate
+# 4xx error rate
+sum(rate(rpc_requests_total{status=~"4.."}[5m]))
+
+# 5xx error rate
+sum(rate(rpc_requests_total{status=~"5.."}[5m]))
+
+# Success rate percentage
+sum(rate(rpc_requests_total{status="200"}[5m]))
+  / sum(rate(rpc_requests_total[5m]))
+  * 100
+```
+
+```promql Top Methods
+# Top 10 RPC methods by request rate
+topk(10, sum by (rpc_method) (
+  rate(rpc_requests_total[5m])
+))
+```
+
+```promql Owner Usage
+# Requests per API key owner
+sum by (owner) (rate(rpc_requests_total[5m]))
+
+# Top 5 owners by request volume
+topk(5, sum by (owner) (
+  rate(rpc_requests_total[1h])
+))
+```
+
+</CodeGroup>
+
+## WebSocket Metrics
+
+### ws_connections_total
+
+**Type**: Counter  
+**Labels**: `backend`, `owner`, `status`
+
+Tracks WebSocket connection attempts with status outcomes.
+
+**Status Values**:
+- `connected` - Successful upgrade and backend connection
+- `auth_failed` - Invalid API key or missing authentication
+- `rate_limited` - Rate limit exceeded
+- `no_backend` - No healthy backends with `ws_url`
+- `backend_connect_failed` - Failed to connect to backend WebSocket
+- `error` - Internal error (Redis failure, etc.)
+
+Implementation in `src/handlers.rs:359,371,380,394,432`:
+
+```rust src/handlers.rs
+// Successful connection
+counter!("ws_connections_total", 
+    "backend" => backend_label.clone(), 
+    "owner" => owner.clone(), 
+    "status" => "connected").increment(1);
+
+// Auth failure
+counter!("ws_connections_total", 
+    "backend" => "none", 
+    "owner" => "none", 
+    "status" => "auth_failed").increment(1);
+
+// Rate limited
+counter!("ws_connections_total", 
+    "backend" => "none", 
+    "owner" => "none", 
+    "status" => "rate_limited").increment(1);
+```
+
+**Example Queries**:
+
+<CodeGroup>
+
+```promql Connection Rate
+# Successful connections per second
+rate(ws_connections_total{status="connected"}[5m])
+
+# Failed connections per second
+rate(ws_connections_total{status!="connected"}[5m])
+```
+
+```promql Success Rate
+# Connection success percentage
+sum(rate(ws_connections_total{status="connected"}[5m]))
+  / sum(rate(ws_connections_total[5m]))
+  * 100
+```
+
+```promql Failure Analysis
+# Breakdown of failure reasons
+sum by (status) (
+  rate(ws_connections_total{status!="connected"}[5m])
+)
+```
+
+</CodeGroup>
+
+### ws_active_connections
+
+**Type**: Gauge  
+**Labels**: `backend`, `owner`
+
+Tracks currently open WebSocket sessions.
+
+Implementation in `src/handlers.rs:438,549`:
+
+```rust src/handlers.rs
+// Increment on connect
+gauge!("ws_active_connections", 
+    "backend" => backend_label.clone(), 
+    "owner" => owner.clone())
+    .increment(1.0);
+
+// Decrement on disconnect
+gauge!("ws_active_connections", 
+    "backend" => backend_label.clone(), 
+    "owner" => owner.clone())
+    .decrement(1.0);
+```
+
+**Example Queries**:
+
+<CodeGroup>
+
+```promql Current Connections
+# Total active connections
+sum(ws_active_connections)
+
+# Active connections per backend
+sum by (backend) (ws_active_connections)
+
+# Active connections per owner
+sum by (owner) (ws_active_connections)
+```
+
+```promql Capacity Monitoring
+# Connection count over time
+ws_active_connections
+
+# Peak connections in last hour
+max_over_time(ws_active_connections[1h])
+```
+
+</CodeGroup>
+
+### ws_messages_total
+
+**Type**: Counter  
+**Labels**: `backend`, `owner`, `direction`
+
+Counts WebSocket frames relayed in each direction.
+
+**Direction Values**:
+- `client_to_backend` - Messages from client to backend
+- `backend_to_client` - Messages from backend to client
+
+Implementation in `src/handlers.rs:461,471,508,514`:
+
+```rust src/handlers.rs
+// Client to backend
+counter!("ws_messages_total", 
+    "backend" => bl1.clone(), 
+    "owner" => ow1.clone(), 
+    "direction" => "client_to_backend")
+    .increment(1);
+
+// Backend to client
+counter!("ws_messages_total", 
+    "backend" => bl2.clone(), 
+    "owner" => ow2.clone(), 
+    "direction" => "backend_to_client")
+    .increment(1);
+```
+
+<Note>
+Only **Text** and **Binary** frames are counted. Ping/Pong frames are forwarded transparently without incrementing metrics.
+</Note>
+
+**Example Queries**:
+
+<CodeGroup>
+
+```promql Message Rate
+# Total messages per second
+sum(rate(ws_messages_total[5m]))
+
+# Messages per direction
+sum by (direction) (rate(ws_messages_total[5m]))
+
+# Inbound vs outbound ratio
+rate(ws_messages_total{direction="client_to_backend"}[5m])
+  / rate(ws_messages_total{direction="backend_to_client"}[5m])
+```
+
+```promql Throughput Analysis
+# Messages per backend
+sum by (backend) (rate(ws_messages_total[5m]))
+
+# Top owners by message volume
+topk(10, sum by (owner) (
+  rate(ws_messages_total[5m])
+))
+```
+
+</CodeGroup>
+
+### ws_connection_duration_seconds
+
+**Type**: Histogram  
+**Labels**: `backend`, `owner`
+
+Tracks session duration from upgrade to disconnect.
+
+Implementation in `src/handlers.rs:550`:
+
+```rust src/handlers.rs
+let duration = connect_time.elapsed().as_secs_f64();
+histogram!("ws_connection_duration_seconds", 
+    "backend" => backend_label.clone(), 
+    "owner" => owner.clone())
+    .record(duration);
+```
+
+**Example Queries**:
+
+<CodeGroup>
+
+```promql Average Duration
+# Average connection duration
+rate(ws_connection_duration_seconds_sum[5m])
+  / rate(ws_connection_duration_seconds_count[5m])
+
+# Average per backend
+rate(ws_connection_duration_seconds_sum[5m])
+  / rate(ws_connection_duration_seconds_count[5m])
+  by (backend)
+```
+
+```promql Duration Percentiles
+# 50th percentile (median)
+histogram_quantile(0.5,
+  rate(ws_connection_duration_seconds_bucket[5m])
+)
+
+# 95th percentile
+histogram_quantile(0.95,
+  rate(ws_connection_duration_seconds_bucket[5m])
+)
+```
+
+</CodeGroup>
+
+## Grafana Dashboard Panels
+
+### Request Overview
+
+<Tabs>
+  <Tab title="Request Rate">
+    **Visualization**: Graph (Time Series)
+    
+    ```promql
+    sum(rate(rpc_requests_total[5m]))
+    ```
+    
+    **Legend**: Total Requests/sec
+  </Tab>
+  
+  <Tab title="Latency Percentiles">
+    **Visualization**: Graph (Time Series)
+    
+    ```promql
+    histogram_quantile(0.50, rate(rpc_request_duration_seconds_bucket[5m]))
+    histogram_quantile(0.95, rate(rpc_request_duration_seconds_bucket[5m]))
+    histogram_quantile(0.99, rate(rpc_request_duration_seconds_bucket[5m]))
+    ```
+    
+    **Legend**: p50, p95, p99
+  </Tab>
+  
+  <Tab title="Error Rate">
+    **Visualization**: Graph (Time Series)
+    
+    ```promql
+    sum(rate(rpc_requests_total{status=~"4.."}[5m]))
+    sum(rate(rpc_requests_total{status=~"5.."}[5m]))
+    ```
+    
+    **Legend**: 4xx Errors, 5xx Errors
+  </Tab>
+  
+  <Tab title="Requests by Backend">
+    **Visualization**: Stacked Graph
+    
+    ```promql
+    sum by (backend) (rate(rpc_requests_total[5m]))
+    ```
+    
+    **Legend**: {{backend}}
+  </Tab>
+</Tabs>
+
+### Backend Health
+
+<Tabs>
+  <Tab title="Backend Status">
+    **Visualization**: Stat Panel
+    
+    Query `/health` endpoint and display backend status.
+    
+    Use JSON API datasource or Infinity plugin.
+  </Tab>
+  
+  <Tab title="Request Distribution">
+    **Visualization**: Pie Chart
+    
+    ```promql
+    sum by (backend) (rate(rpc_requests_total[5m]))
+    ```
+    
+    Shows traffic percentage per backend.
+  </Tab>
+  
+  <Tab title="Backend Latency Comparison">
+    **Visualization**: Bar Gauge
+    
+    ```promql
+    rate(rpc_request_duration_seconds_sum[5m])
+      / rate(rpc_request_duration_seconds_count[5m])
+      by (backend)
+    ```
+    
+    Compares average latency across backends.
+  </Tab>
+</Tabs>
+
+### WebSocket Monitoring
+
+<Tabs>
+  <Tab title="Active Connections">
+    **Visualization**: Stat Panel + Graph
+    
+    ```promql
+    sum(ws_active_connections)
+    ```
+    
+    Current count with time series.
+  </Tab>
+  
+  <Tab title="Connection Rate">
+    **Visualization**: Graph (Time Series)
+    
+    ```promql
+    rate(ws_connections_total{status="connected"}[5m])
+    rate(ws_connections_total{status!="connected"}[5m])
+    ```
+    
+    **Legend**: Successful, Failed
+  </Tab>
+  
+  <Tab title="Message Throughput">
+    **Visualization**: Graph (Time Series)
+    
+    ```promql
+    sum by (direction) (rate(ws_messages_total[5m]))
+    ```
+    
+    **Legend**: {{direction}}
+  </Tab>
+  
+  <Tab title="Connection Duration">
+    **Visualization**: Heatmap
+    
+    ```promql
+    sum(rate(ws_connection_duration_seconds_bucket[5m])) by (le)
+    ```
+    
+    Shows distribution of connection durations.
+  </Tab>
+</Tabs>
+
+### API Key Usage
+
+<Tabs>
+  <Tab title="Requests per Owner">
+    **Visualization**: Table
+    
+    ```promql
+    sum by (owner) (rate(rpc_requests_total[5m]))
+    ```
+    
+    Columns: Owner, Requests/sec
+  </Tab>
+  
+  <Tab title="Top Users">
+    **Visualization**: Bar Gauge
+    
+    ```promql
+    topk(10, sum by (owner) (
+      rate(rpc_requests_total[1h])
+    ))
+    ```
+    
+    Top 10 users by request volume.
+  </Tab>
+  
+  <Tab title="Rate Limited Requests">
+    **Visualization**: Stat Panel
+    
+    ```promql
+    sum(rate(rpc_requests_total{status="429"}[5m]))
+    ```
+    
+    Count of rate-limited requests.
+  </Tab>
+</Tabs>
+
+### RPC Method Analysis
+
+<Tabs>
+  <Tab title="Top Methods">
+    **Visualization**: Table
+    
+    ```promql
+    topk(20, sum by (rpc_method) (
+      rate(rpc_requests_total[5m])
+    ))
+    ```
+    
+    Top 20 methods by request rate.
+  </Tab>
+  
+  <Tab title="Method Latency">
+    **Visualization**: Heatmap
+    
+    ```promql
+    sum by (rpc_method, le) (
+      rate(rpc_request_duration_seconds_bucket[5m])
+    )
+    ```
+    
+    Latency distribution per method.
+  </Tab>
+  
+  <Tab title="Slowest Methods">
+    **Visualization**: Bar Gauge
+    
+    ```promql
+    topk(10,
+      rate(rpc_request_duration_seconds_sum[5m])
+        / rate(rpc_request_duration_seconds_count[5m])
+        by (rpc_method)
+    )
+    ```
+    
+    Top 10 slowest methods by average latency.
+  </Tab>
+</Tabs>
+
+## Alerting Rules
+
+### High Error Rate
+
+```yaml
+groups:
+  - name: rpc_router_alerts
+    rules:
+      - alert: HighErrorRate
+        expr: |
+          sum(rate(rpc_requests_total{status=~"5.."}[5m]))
+            / sum(rate(rpc_requests_total[5m]))
+            > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High 5xx error rate ({{ $value | humanizePercentage }})"
+          description: "More than 5% of requests are returning 5xx errors"
+```
+
+### Backend Down
+
+```yaml
+- alert: AllBackendsUnhealthy
+  expr: |
+    absent(backend_healthy{healthy="true"})
+  for: 1m
+  labels:
+    severity: critical
+  annotations:
+    summary: "All backends are unhealthy"
+    description: "No healthy backends available for routing"
+```
+
+### High Latency
+
+```yaml
+- alert: HighLatency
+  expr: |
+    histogram_quantile(0.95,
+      rate(rpc_request_duration_seconds_bucket[5m])
+    ) > 2.0
+  for: 10m
+  labels:
+    severity: warning
+  annotations:
+    summary: "High p95 latency ({{ $value }}s)"
+    description: "95th percentile latency is above 2 seconds"
+```
+
+### WebSocket Failures
+
+```yaml
+- alert: WebSocketConnectionFailures
+  expr: |
+    sum(rate(ws_connections_total{status!="connected"}[5m]))
+      / sum(rate(ws_connections_total[5m]))
+      > 0.10
+  for: 5m
+  labels:
+    severity: warning
+  annotations:
+    summary: "High WebSocket failure rate ({{ $value | humanizePercentage }})"
+    description: "More than 10% of WebSocket connections are failing"
+```
+
+### Rate Limit Threshold
+
+```yaml
+- alert: HighRateLimitRejections
+  expr: |
+    sum(rate(rpc_requests_total{status="429"}[5m])) > 10
+  for: 5m
+  labels:
+    severity: info
+  annotations:
+    summary: "High rate limit rejections"
+    description: "More than 10 requests/sec are being rate limited"
+```
+
+## Health Endpoint
+
+In addition to Prometheus metrics, the router provides a health check endpoint:
+
+```bash
+curl http://localhost:28899/health
+```
+
+**Response** (src/handlers.rs:296-310):
+
+```json
+{
+  "overall_status": "healthy",
+  "backends": [
+    {
+      "label": "mainnet-primary",
+      "healthy": true,
+      "last_check": "Instant { ... }",
+      "consecutive_failures": 0,
+      "consecutive_successes": 15,
+      "last_error": null
+    },
+    {
+      "label": "backup-rpc",
+      "healthy": false,
+      "last_check": "Instant { ... }",
+      "consecutive_failures": 5,
+      "consecutive_successes": 0,
+      "last_error": "Connection timeout"
+    }
+  ]
+}
+```
+
+**Fields**:
+- `overall_status`: `"healthy"` if any backend is healthy, else `"unhealthy"`
+- `backends`: Array of backend health details
+  - `label`: Backend identifier
+  - `healthy`: Current health status
+  - `last_check`: Timestamp of last health check
+  - `consecutive_failures`: Failure streak count
+  - `consecutive_successes`: Success streak count
+  - `last_error`: Most recent error message (if any)
+
+<Tip>
+Use the `/health` endpoint for external load balancer health checks or monitoring systems that don't support Prometheus.
+</Tip>
+
+## Metric Label Cardinality
+
+### Label Values
+
+All metrics use labels with controlled cardinality:
+
+| Label | Cardinality | Example Values |
+|-------|-------------|----------------|
+| `backend` | Low (2-10) | `mainnet-primary`, `backup-rpc` |
+| `owner` | Medium (10-1000) | API key owner identifiers |
+| `rpc_method` | Low (~50) | `getSlot`, `getTransaction`, etc. |
+| `method` | Very Low (2-3) | `POST`, `GET` |
+| `status` | Low (~10) | `200`, `401`, `429`, `500`, etc. |
+| `direction` | Very Low (2) | `client_to_backend`, `backend_to_client` |
+
+<Warning>
+High cardinality in the `owner` label can impact Prometheus performance with thousands of API keys. Consider aggregating by owner selectively or using recording rules.
+</Warning>
+
+### Recording Rules
+
+Pre-aggregate common queries to reduce query time:
+
+```yaml
+groups:
+  - name: rpc_router_recordings
+    interval: 30s
+    rules:
+      # Total request rate
+      - record: rpc:requests:rate5m
+        expr: sum(rate(rpc_requests_total[5m]))
+      
+      # Request rate per backend
+      - record: rpc:requests:rate5m:by_backend
+        expr: sum by (backend) (rate(rpc_requests_total[5m]))
+      
+      # Average latency per backend
+      - record: rpc:latency:avg5m:by_backend
+        expr: |
+          rate(rpc_request_duration_seconds_sum[5m])
+            / rate(rpc_request_duration_seconds_count[5m])
+            by (backend)
+      
+      # P95 latency
+      - record: rpc:latency:p95:5m
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le) (rate(rpc_request_duration_seconds_bucket[5m]))
+          )
+```
+
+## Log Integration
+
+Requests are logged with structured fields for correlation with metrics (src/handlers.rs:72-103):
+
+```rust src/handlers.rs
+match (rpc_method, backend) {
+    (Some(RpcMethod(m)), Some(SelectedBackend(b))) => info!(
+        "{} {} {} {:?} rpc_method={} backend={}",
+        method, path, addr, duration, m, b
+    ),
+    // ... other cases
+}
+```
+
+**Example Log Output**:
+
+```log
+INFO POST / 127.0.0.1:54321 42ms rpc_method=getSlot backend=mainnet-primary
+INFO POST / 127.0.0.1:54322 156ms rpc_method=getTransaction backend=archive-node
+WARN API key rate limited (prefix=abc123...)
+```
+
+<Tip>
+Use log aggregation (Loki, Elasticsearch) to correlate metrics with detailed request logs. Filter by `rpc_method` or `backend` to investigate latency spikes.
+</Tip>
+
+## Monitoring Best Practices
+
+<AccordionGroup>
+  <Accordion title="Dashboard Layout">
+    Organize Grafana dashboards by user role:
+    
+    - **Operations**: Request rate, error rate, latency, backend health
+    - **Performance**: Latency percentiles, slowest methods, backend comparison
+    - **Business**: Requests per owner, top methods, usage trends
+    - **WebSocket**: Active connections, message throughput, connection duration
+  </Accordion>
+  
+  <Accordion title="Alert Thresholds">
+    Set alert thresholds based on baseline behavior:
+    
+    1. Collect 1-2 weeks of metrics
+    2. Calculate p95/p99 for latency, error rate, etc.
+    3. Set thresholds 20-30% above normal values
+    4. Adjust based on incident frequency
+  </Accordion>
+  
+  <Accordion title="Retention Policy">
+    Configure Prometheus retention based on query patterns:
+    
+    - **Raw metrics**: 15-30 days (for incident investigation)
+    - **Recording rules**: 90+ days (for trend analysis)
+    - **Long-term storage**: Use Thanos or Cortex for historical data
+  </Accordion>
+  
+  <Accordion title="Query Performance">
+    Optimize dashboard queries:
+    
+    - Use recording rules for frequently-queried aggregations
+    - Limit time ranges to necessary windows (5m, 1h, 24h)
+    - Avoid high-cardinality group-by operations on `owner` label
+    - Use instant queries for current-state panels (gauges, stats)
+  </Accordion>
+</AccordionGroup>
+
+## Sample Prometheus Config
+
+```yaml prometheus.yml
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: 'sol-rpc-router'
+    static_configs:
+      - targets: ['localhost:9091']
+        labels:
+          environment: 'production'
+          cluster: 'us-west-2'
+
+rule_files:
+  - 'rpc_router_alerts.yml'
+  - 'rpc_router_recordings.yml'
+```
+
+## Exporting Metrics
+
+The metrics endpoint returns standard Prometheus exposition format:
+
+```bash
+curl -s http://localhost:9091/metrics | grep rpc_requests_total | head -5
+```
+
+**Output**:
+
+```prometheus
+rpc_requests_total{backend="mainnet-primary",method="POST",owner="client-a",rpc_method="getSlot",status="200"} 1523
+rpc_requests_total{backend="mainnet-primary",method="POST",owner="client-a",rpc_method="getTransaction",status="200"} 342
+rpc_requests_total{backend="backup-rpc",method="POST",owner="client-b",rpc_method="getSlot",status="200"} 891
+rpc_requests_total{backend="mainnet-primary",method="POST",owner="client-a",rpc_method="sendTransaction",status="429"} 15
+```
+
+<Check>
+All metrics follow Prometheus naming conventions with `_total`, `_seconds`, `_bucket` suffixes for counters, histograms, and histogram buckets.
+</Check>

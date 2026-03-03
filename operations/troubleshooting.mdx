@@ -1,0 +1,678 @@
+---
+title: 'Troubleshooting'
+description: 'Debug common issues with logs, metrics, and health checks'
+---
+
+## Common Issues
+
+### Startup Failures
+
+#### Redis Connection Failed
+
+**Symptom**:
+```
+Failed to initialize Redis KeyStore: Connection refused (os error 111)
+```
+
+**Cause**: Redis is not running or not accessible
+
+**Solutions**:
+1. Start Redis:
+   ```bash
+   # Using systemd
+   sudo systemctl start redis
+   
+   # Using Docker
+   docker run -d -p 6379:6379 redis
+   ```
+
+2. Verify Redis is listening:
+   ```bash
+   redis-cli ping
+   # Should return: PONG
+   ```
+
+3. Check Redis URL in config:
+   ```toml
+   redis_url = "redis://127.0.0.1:6379/0"
+   ```
+
+4. Test connection:
+   ```bash
+   redis-cli -u redis://127.0.0.1:6379/0 ping
+   ```
+
+#### Port Already in Use
+
+**Symptom**:
+```
+Failed to bind HTTP server: Address already in use (os error 98)
+```
+
+**Cause**: Another process is using the configured port
+
+**Solutions**:
+1. Find the process using the port:
+   ```bash
+   # HTTP port (28899)
+   lsof -i :28899
+   sudo netstat -tlnp | grep 28899
+   
+   # WebSocket port (28900)
+   lsof -i :28900
+   
+   # Metrics port (28901)
+   lsof -i :28901
+   ```
+
+2. Kill the conflicting process:
+   ```bash
+   kill <pid>
+   ```
+
+3. Or change the port in config:
+   ```toml
+   port = 28899        # HTTP/WS ports
+   metrics_port = 28901
+   ```
+
+#### Configuration Validation Failed
+
+**Symptom**:
+```
+Failed to load router configuration: Backend weight must be greater than 0
+```
+
+**Cause**: Invalid configuration values
+
+**Common validation errors**:
+- Empty Redis URL
+- No backends defined
+- Duplicate backend labels
+- Backend weight ≤ 0
+- Method route referencing non-existent backend
+- Invalid timeout value (≤ 0)
+
+**Solution**: Review configuration against validation rules:
+```toml
+# Valid example
+[[backends]]
+label = "mainnet-primary"  # Must be unique and non-empty
+url = "https://api.mainnet-beta.solana.com"  # Must be valid URL
+weight = 10  # Must be > 0
+
+[proxy]
+timeout_secs = 30  # Must be > 0
+
+[method_routes]
+getSlot = "mainnet-primary"  # Must reference existing backend label
+```
+
+### Request Failures
+
+#### Unauthorized (401)
+
+**Symptom**:
+```bash
+curl http://localhost:28899/?api-key=invalid
+# Returns: 401 Unauthorized
+```
+
+**Log output**:
+```
+Invalid API key presented (prefix=invali...)
+```
+
+**Solutions**:
+1. Verify API key exists:
+   ```bash
+   rpc-admin list
+   rpc-admin inspect <api-key>
+   ```
+
+2. Create a new API key:
+   ```bash
+   rpc-admin create my-client --rate-limit 50
+   ```
+
+3. Check key is active:
+   ```bash
+   rpc-admin inspect <api-key>
+   # Verify: active: true
+   ```
+
+#### Rate Limited (429)
+
+**Symptom**:
+```bash
+curl http://localhost:28899/?api-key=my-key
+# Returns: 429 Too Many Requests: Rate limit exceeded
+```
+
+**Log output**:
+```
+API key rate limited (prefix=my-key...)
+```
+
+**Solutions**:
+1. Check current rate limit:
+   ```bash
+   rpc-admin inspect <api-key>
+   ```
+
+2. Increase rate limit:
+   ```bash
+   rpc-admin update <api-key> --rate-limit 100
+   ```
+
+3. Monitor rate limit metrics:
+   ```promql
+   sum(rate(rpc_requests_total{status="429"}[1m]))
+   sum(rate(rpc_requests_total{status="429"}[1m])) by (owner)
+   ```
+
+#### No Healthy Backends (503)
+
+**Symptom**:
+```
+503 Service Unavailable: No healthy backends available
+```
+
+**Log output**:
+```
+No healthy backends available for request
+```
+
+**Solutions**:
+1. Check backend health status:
+   ```bash
+   curl http://localhost:28899/health | jq
+   ```
+
+2. Check health metrics:
+   ```promql
+   rpc_backend_health
+   sum(rpc_backend_health)  # Should be > 0
+   ```
+
+3. Review health check logs:
+   ```bash
+   journalctl -u sol-rpc-router | grep "Health check"
+   ```
+
+4. Common health check failures:
+   - Backend is down
+   - Backend is too slow (timeout)
+   - Backend is lagging (slot lag)
+   - Network connectivity issues
+
+See [Backend Health Issues](#backend-health-issues) for detailed diagnostics.
+
+#### Gateway Timeout (504)
+
+**Symptom**:
+```
+504 Gateway Timeout: Upstream request timed out after 30s
+```
+
+**Cause**: Backend took longer than `proxy.timeout_secs` to respond
+
+**Solutions**:
+1. Increase proxy timeout:
+   ```toml
+   [proxy]
+   timeout_secs = 60  # Increase from 30
+   ```
+
+2. Reload configuration:
+   ```bash
+   kill -SIGHUP $(pidof sol-rpc-router)
+   ```
+
+3. Check backend performance:
+   ```bash
+   # Test backend directly
+   time curl -X POST https://api.mainnet-beta.solana.com \
+     -H "Content-Type: application/json" \
+     -d '{"jsonrpc":"2.0","id":1,"method":"getHealth"}'
+   ```
+
+4. Monitor backend latency:
+   ```promql
+   histogram_quantile(0.99, sum(rate(rpc_request_duration_seconds_bucket[5m])) by (le, backend))
+   ```
+
+### Backend Health Issues
+
+#### Backend Marked Unhealthy
+
+**Log output**:
+```
+Backend mainnet-primary marked as UNHEALTHY after 3 consecutive failures
+```
+
+**Diagnostic steps**:
+
+1. **Check last error**:
+   ```bash
+   curl http://localhost:28899/health | jq '.backends[] | select(.label == "mainnet-primary")'
+   ```
+
+2. **Test backend directly**:
+   ```bash
+   curl -X POST https://api.mainnet-beta.solana.com \
+     -H "Content-Type: application/json" \
+     -d '{"jsonrpc":"2.0","id":1,"method":"getSlot"}'
+   ```
+
+3. **Check health check configuration**:
+   ```toml
+   [health_check]
+   interval_secs = 30
+   timeout_secs = 5        # May be too low
+   method = "getSlot"      # Verify backend supports this
+   consecutive_failures_threshold = 3
+   ```
+
+4. **Common failure reasons**:
+
+   **Timeout**:
+   ```
+   Health check timed out after 5s
+   ```
+   Solution: Increase `timeout_secs` or investigate backend slowness
+
+   **Non-200 status**:
+   ```
+   Health check returned status: 503
+   ```
+   Solution: Backend is down or overloaded
+
+   **Slot lag**:
+   ```
+   Backend lagging: slot 123456 is 150 behind max 123606
+   ```
+   Solution: Backend is syncing, increase `max_slot_lag` or wait for sync
+
+#### Frequent Health State Flapping
+
+**Symptom**:
+```
+Backend mainnet-primary marked as UNHEALTHY after 3 consecutive failures
+Backend mainnet-primary marked as HEALTHY after 2 consecutive successes
+Backend mainnet-primary marked as UNHEALTHY after 3 consecutive failures
+```
+
+**Cause**: Backend is intermittently failing health checks
+
+**Solutions**:
+1. Increase thresholds to reduce flapping:
+   ```toml
+   [health_check]
+   consecutive_failures_threshold = 5  # Increase from 3
+   consecutive_successes_threshold = 3  # Increase from 2
+   ```
+
+2. Increase health check interval:
+   ```toml
+   [health_check]
+   interval_secs = 60  # Reduce check frequency
+   ```
+
+3. Investigate backend stability:
+   - Check backend logs
+   - Monitor backend resource usage
+   - Test network connectivity
+
+### WebSocket Issues
+
+#### WebSocket Connection Failed
+
+**Log output**:
+```
+WebSocket: Failed to connect to backend mainnet-primary (wss://api.mainnet-beta.solana.com): Connection refused
+```
+
+**Solutions**:
+1. Verify backend WebSocket URL:
+   ```toml
+   [[backends]]
+   label = "mainnet-primary"
+   url = "https://api.mainnet-beta.solana.com"
+   ws_url = "wss://api.mainnet-beta.solana.com"  # Check this
+   ```
+
+2. Test WebSocket endpoint directly:
+   ```bash
+   wscat -c wss://api.mainnet-beta.solana.com
+   ```
+
+3. Check WebSocket metrics:
+   ```promql
+   sum(rate(ws_connections_total{status="backend_connect_failed"}[5m]))
+   ```
+
+#### No WebSocket Backends Available
+
+**Symptom**:
+```
+503 Service Unavailable: No healthy WebSocket backends available
+```
+
+**Cause**: No backends have `ws_url` configured or all WS backends are unhealthy
+
+**Solutions**:
+1. Add WebSocket URLs to backends:
+   ```toml
+   [[backends]]
+   label = "mainnet-primary"
+   url = "https://api.mainnet-beta.solana.com"
+   ws_url = "wss://api.mainnet-beta.solana.com"  # Add this
+   ```
+
+2. Check which backends support WebSocket:
+   ```bash
+   grep -A 4 "\[\[backends\]\]" config.toml | grep ws_url
+   ```
+
+3. Reload configuration:
+   ```bash
+   kill -SIGHUP $(pidof sol-rpc-router)
+   ```
+
+### Configuration Reload Issues
+
+#### Reload Not Taking Effect
+
+**Symptom**: Sent SIGHUP but configuration unchanged
+
+**Diagnostic steps**:
+
+1. **Check logs for reload attempt**:
+   ```bash
+   journalctl -u sol-rpc-router | grep -i sighup
+   ```
+   
+   Expected:
+   ```
+   Received SIGHUP, reloading configuration from config.toml
+   Configuration reloaded successfully
+   Router state atomically swapped
+   ```
+
+2. **Verify signal reached process**:
+   ```bash
+   # Check if process is running
+   kill -0 $(pidof sol-rpc-router) && echo "Running" || echo "Not running"
+   ```
+
+3. **Check for validation errors**:
+   ```bash
+   journalctl -u sol-rpc-router | grep -i "failed to reload"
+   ```
+
+4. **Verify config file permissions**:
+   ```bash
+   ls -l config.toml
+   # Should be readable by router process user
+   ```
+
+#### Configuration Validation Failed on Reload
+
+**Log output**:
+```
+Failed to reload configuration: Method route 'getSlot' references non-existent backend 'unknown'
+```
+
+**Solution**: Old configuration remains active. Fix validation error and retry:
+1. Review error message
+2. Fix configuration
+3. Send SIGHUP again
+
+## Debugging Tools
+
+### Log Analysis
+
+#### Enable Debug Logging
+
+```bash
+RUST_LOG=debug ./sol-rpc-router --config config.toml
+```
+
+Log levels:
+- `error`: Critical failures
+- `warn`: Non-critical issues (health check failures, rate limits)
+- `info`: Normal operations (requests, reloads)
+- `debug`: Detailed diagnostics
+
+#### Filter Logs by Component
+
+```bash
+# Health check logs only
+journalctl -u sol-rpc-router | grep "Health check"
+
+# WebSocket logs only
+journalctl -u sol-rpc-router | grep "WebSocket"
+
+# Configuration reload logs
+journalctl -u sol-rpc-router | grep -i "reload\|sighup"
+
+# Request logs with RPC method
+journalctl -u sol-rpc-router | grep "rpc_method="
+```
+
+#### Structured Log Parsing
+
+Logs use structured format. Example log line:
+```
+POST / 192.168.1.100:54321 1.234s rpc_method=getSlot backend=mainnet-primary
+```
+
+Parse with awk:
+```bash
+# Extract requests by RPC method
+journalctl -u sol-rpc-router | awk '/rpc_method=getSlot/'
+
+# Extract requests by backend
+journalctl -u sol-rpc-router | awk '/backend=mainnet-primary/'
+
+# Extract slow requests (>1s)
+journalctl -u sol-rpc-router | awk '$5 ~ /^[1-9]/ && $5 ~ /s$/'
+```
+
+### Health Check Diagnostics
+
+#### Manual Health Check Test
+
+Simulate the router's health check:
+
+```bash
+# Test with getSlot (default health check method)
+curl -X POST https://api.mainnet-beta.solana.com \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"getSlot"}' \
+  --max-time 5
+
+# Test with getBlockHeight
+curl -X POST https://api.mainnet-beta.solana.com \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"getBlockHeight"}' \
+  --max-time 5
+```
+
+Expected response:
+```json
+{"jsonrpc":"2.0","result":123456789,"id":1}
+```
+
+#### Check Backend Slot Lag
+
+```bash
+# Query all backends
+for backend in "https://api.mainnet-beta.solana.com" "https://solana-api.com"; do
+  slot=$(curl -s -X POST "$backend" \
+    -H "Content-Type: application/json" \
+    -d '{"jsonrpc":"2.0","id":1,"method":"getSlot"}' \
+    | jq -r '.result')
+  echo "$backend: slot $slot"
+done
+
+# Calculate lag manually
+```
+
+### Metrics-Based Debugging
+
+#### Check Current Backend Health
+
+```bash
+# Query Prometheus
+curl -s 'http://localhost:9090/api/v1/query?query=rpc_backend_health' | jq
+
+# Or query router metrics directly
+curl -s http://localhost:28901/metrics | grep rpc_backend_health
+```
+
+#### Identify High-Error Backends
+
+```promql
+# Error rate by backend
+sum(rate(rpc_requests_total{status!="200"}[5m])) by (backend)
+
+# Backends with >5% error rate
+sum(rate(rpc_requests_total{status!="200"}[5m])) by (backend)
+/ sum(rate(rpc_requests_total[5m])) by (backend) > 0.05
+```
+
+#### Identify Slow Backends
+
+```promql
+# P99 latency by backend
+histogram_quantile(0.99, 
+  sum(rate(rpc_request_duration_seconds_bucket[5m])) by (le, backend)
+)
+
+# Backends with P99 > 5s
+histogram_quantile(0.99,
+  sum(rate(rpc_request_duration_seconds_bucket[5m])) by (le, backend)
+) > 5
+```
+
+### Network Diagnostics
+
+#### Test Backend Connectivity
+
+```bash
+# DNS resolution
+dig api.mainnet-beta.solana.com
+
+# TCP connectivity
+telnet api.mainnet-beta.solana.com 443
+
+# TLS handshake
+openssl s_client -connect api.mainnet-beta.solana.com:443 -servername api.mainnet-beta.solana.com
+
+# Full request test
+curl -v https://api.mainnet-beta.solana.com
+```
+
+#### Check Network Latency
+
+```bash
+# Ping test
+ping -c 5 api.mainnet-beta.solana.com
+
+# Traceroute
+traceroute api.mainnet-beta.solana.com
+
+# MTR (combined ping + traceroute)
+mtr --report --report-cycles 10 api.mainnet-beta.solana.com
+```
+
+## Performance Issues
+
+### High Memory Usage
+
+**Diagnostic**:
+```bash
+ps aux | grep sol-rpc-router
+top -p $(pidof sol-rpc-router)
+```
+
+**Potential causes**:
+- Too many active WebSocket connections
+- Large request/response bodies
+- Memory leak (report as bug)
+
+**Solutions**:
+1. Check active WebSocket connections:
+   ```promql
+   sum(ws_active_connections)
+   ```
+
+2. Monitor connection duration:
+   ```promql
+   histogram_quantile(0.99, sum(rate(ws_connection_duration_seconds_bucket[5m])) by (le))
+   ```
+
+3. Restart if memory leak suspected:
+   ```bash
+   systemctl restart sol-rpc-router
+   ```
+
+### High CPU Usage
+
+**Diagnostic**:
+```bash
+top -p $(pidof sol-rpc-router)
+```
+
+**Potential causes**:
+- High request volume
+- Expensive regex in logs
+- Too frequent health checks
+
+**Solutions**:
+1. Check request rate:
+   ```promql
+   sum(rate(rpc_requests_total[1m]))
+   ```
+
+2. Reduce health check frequency:
+   ```toml
+   [health_check]
+   interval_secs = 60  # Increase from 30
+   ```
+
+3. Consider horizontal scaling
+
+## Getting Help
+
+If you've tried the above steps and still have issues:
+
+1. **Collect diagnostic information**:
+   ```bash
+   # Router version
+   ./sol-rpc-router --version
+   
+   # Configuration (redact sensitive URLs)
+   cat config.toml
+   
+   # Recent logs
+   journalctl -u sol-rpc-router --since "1 hour ago" > router-logs.txt
+   
+   # Health status
+   curl http://localhost:28899/health > health-status.json
+   
+   # Metrics snapshot
+   curl http://localhost:28901/metrics > metrics.txt
+   ```
+
+2. **Check existing issues**: Search the GitHub issue tracker
+
+3. **Report the bug**: Include diagnostic info and steps to reproduce
+
+## Next Steps
+
+- [Deploy to production](/operations/deployment)
+- [Set up monitoring](/operations/monitoring)
+- [Configure hot reload](/operations/hot-reload)
