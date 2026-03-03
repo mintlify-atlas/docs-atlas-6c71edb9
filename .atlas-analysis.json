@@ -1,0 +1,96 @@
+{
+  "projectType": "infrastructure",
+  "projectName": "Sol RPC Router",
+  "projectDescription": "High-performance Solana RPC reverse proxy with API key authentication, rate limiting, weighted load balancing, and health monitoring.",
+  "theme": "aspen",
+  "primaryColor": "#14F195",
+  "lightColor": "#9945FF",
+  "darkColor": "#14F195",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "installation"
+            ]
+          },
+          {
+            "group": "Configuration",
+            "pages": [
+              "configuration/overview",
+              "configuration/backends",
+              "configuration/health-checks",
+              "configuration/rate-limiting",
+              "configuration/method-routing"
+            ]
+          },
+          {
+            "group": "Features",
+            "pages": [
+              "features/authentication",
+              "features/load-balancing",
+              "features/websocket-support",
+              "features/metrics"
+            ]
+          },
+          {
+            "group": "Operations",
+            "pages": [
+              "operations/deployment",
+              "operations/monitoring",
+              "operations/hot-reload",
+              "operations/troubleshooting"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "CLI Tools",
+            "pages": [
+              "api/rpc-admin",
+              "api/server-options"
+            ]
+          },
+          {
+            "group": "Endpoints",
+            "pages": [
+              "api/proxy-endpoint",
+              "api/health-endpoint",
+              "api/metrics-endpoint",
+              "api/websocket-endpoint"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "API key authentication with Redis backing",
+    "Per-key rate limiting with atomic Redis operations",
+    "Weighted load balancing across multiple backends",
+    "Method-based routing for specific RPC calls",
+    "WebSocket proxying with full auth support",
+    "Background health checks with automatic failover",
+    "Prometheus metrics and Grafana dashboards",
+    "Hot configuration reload via SIGHUP"
+  ],
+  "publicApiSurface": [
+    "POST / - Proxy JSON-RPC requests",
+    "GET / (WebSocket) - WebSocket proxy on main port",
+    "GET /health - Backend health status",
+    "GET /metrics - Prometheus metrics",
+    "rpc-admin create - Create API key",
+    "rpc-admin list - List all API keys",
+    "rpc-admin inspect - Inspect API key details",
+    "rpc-admin revoke - Revoke API key",
+    "rpc-admin update - Update API key settings"
+  ]
+}
