@@ -62,6 +62,17 @@ metric_name{label="value"} value timestamp
   - `rpc_request_duration_seconds_count`: Total number of requests
 </ResponseField>
 
+### Backend Health Metrics
+
+<ResponseField name="rpc_backend_health" type="gauge">
+  Current health status of each backend (1 = healthy, 0 = unhealthy).
+  
+  **Labels:**
+  - `backend`: Backend label
+  
+  Updated by the health check loop every `health_check.interval_secs` seconds. Use this metric to monitor backend availability and trigger alerts when backends go unhealthy.
+</ResponseField>
+
 ### WebSocket Metrics
 
 <ResponseField name="ws_connections_total" type="counter">

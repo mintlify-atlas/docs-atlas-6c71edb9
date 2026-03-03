@@ -38,54 +38,65 @@ Rate limiting requires a Redis instance. Configure the connection in your `confi
 
 Requests must include an API key for rate limiting to work. Common patterns:
 
-### Header-Based (Recommended)
+### Query Parameter (Required)
 
 ```bash
-curl -X POST http://localhost:28899 \
-  -H "X-API-Key: your-api-key-here" \
-  -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"getSlot"}'
-```
-
-### Query Parameter
-
-```bash
-curl -X POST "http://localhost:28899?api_key=your-api-key-here" \
+curl -X POST "http://localhost:28899?api-key=your-api-key-here" \
   -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","id":1,"method":"getSlot"}'
 ```
 
 <Note>
-  The exact API key extraction method depends on your router implementation. Check your authentication middleware configuration.
+  Sol RPC Router uses the `api-key` query parameter (with hyphen) for authentication. The API key is automatically stripped from the request before forwarding to backends for security.
 </Note>
 
 ## Configuring Rate Limits
 
-Rate limits are typically configured per API key in Redis or through an admin API. The configuration system in `src/config.rs` ensures Redis connectivity, but limit values are managed at runtime.
+Rate limits are configured per API key using the `rpc-admin` CLI tool. Each API key has a `rate_limit` value (in requests per second) stored in Redis.
 
 ### Redis Key Structure
 
-Rate limit counters are stored in Redis with keys like:
+Sol RPC Router uses two types of Redis keys:
 
+**API Key Metadata**:
 ```
-ratelimit:[api_key]:[time_window]
+api_key:{key}
+  - owner: String
+  - rate_limit: u64 (requests per second)
+  - created_at: u64
+  - active: "true" | "false"
+  - expires_at: u64 (optional)
 ```
 
-Example:
+**Rate Limit Counters**:
 ```
-ratelimit:abc123:1710892800  # Requests from API key "abc123" in current window
+rate_limit:{api_key}
+  - Value: Counter (incremented per request)
+  - TTL: 1 second (resets every second)
 ```
 
-### Setting Limits via Redis CLI
+### Setting Limits via rpc-admin
 
-You can manually configure limits using Redis:
+Use the `rpc-admin` CLI to create and update rate limits:
 
 ```bash
-# Set limit for API key "abc123" to 1000 requests per minute
-redis-cli SET ratelimit:config:abc123 1000
+# Create a new API key with 100 RPS limit
+./target/release/rpc-admin create my-client --rate-limit 100
 
-# Set TTL for cleanup
-redis-cli EXPIRE ratelimit:config:abc123 86400  # 24 hours
+# Update an existing key's rate limit
+./target/release/rpc-admin update YOUR_API_KEY --rate-limit 200
+```
+
+### Manual Redis Configuration (Advanced)
+
+You can also set limits directly in Redis:
+
+```bash
+# Set rate limit for an API key
+redis-cli HSET api_key:YOUR_API_KEY rate_limit 1000
+
+# View current limit
+redis-cli HGET api_key:YOUR_API_KEY rate_limit
 ```
 
 ## Rate Limit Response

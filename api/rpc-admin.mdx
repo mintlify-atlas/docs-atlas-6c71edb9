@@ -277,3 +277,33 @@ SMEMBERS api_keys_index
 ```
 
 This set is used by the `list` command to enumerate all keys efficiently.
+
+## Caching Behavior
+
+<Warning>
+  API keys are cached in the router's memory for **60 seconds** to reduce Redis load. This means:
+  
+  - Key updates may take up to 60 seconds to take effect across all router instances
+  - Revoked keys may continue to work for up to 60 seconds
+  - Rate limit changes are applied on the next cache miss (maximum 60 seconds)
+  
+  If immediate enforcement is required, restart the router.
+</Warning>
+
+The caching behavior includes:
+
+<AccordionGroup>
+  <Accordion title="Cache Duration">
+    API key metadata is cached for 60 seconds (TTL). After the TTL expires, the next request will fetch fresh data from Redis.
+  </Accordion>
+
+  <Accordion title="Eventual Consistency">
+    Multiple router instances share the same Redis backend but maintain independent caches. Changes made via `rpc-admin` will be eventually consistent across all instances within 60 seconds.
+  </Accordion>
+
+  <Accordion title="Cache Invalidation">
+    There is no manual cache invalidation. To force immediate enforcement of key changes:
+    - Restart the router (recommended for critical changes)
+    - Wait up to 60 seconds for the cache to expire naturally
+  </Accordion>
+</AccordionGroup>

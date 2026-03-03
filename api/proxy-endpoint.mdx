@@ -224,7 +224,9 @@ The router constructs the backend URL as:
 - Request: `POST /v1/mainnet?api-key=abc123&commitment=finalized`
 - Backend: `{backend_url}/v1/mainnet?commitment=finalized`
 
-The `api-key` parameter is stripped before forwarding.
+<Info>
+  **Security**: The `api-key` query parameter is automatically stripped before forwarding requests to backends. This ensures backend nodes never see client API keys, and request logs on backend nodes don't contain sensitive credentials.
+</Info>
 
 ### Example
 

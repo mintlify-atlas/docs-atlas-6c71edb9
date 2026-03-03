@@ -247,8 +247,8 @@ See [Method Routing](/configuration/method-routing) for more details.
 
 Backend health and performance metrics are exposed via Prometheus:
 
-- `backend_health{label="[label]"}` - Current health status (1 = healthy, 0 = unhealthy)
-- `backend_requests_total{label="[label]"}` - Total requests sent to backend
-- `backend_errors_total{label="[label]"}` - Total errors from backend
+- `rpc_backend_health{backend="[label]"}` - Current health status (1 = healthy, 0 = unhealthy)
+- `rpc_requests_total{backend="[label]"}` - Total requests routed to this backend
+- `rpc_request_duration_seconds{backend="[label]"}` - Request latency to this backend
 
 See [Metrics](/features/metrics) for complete list.

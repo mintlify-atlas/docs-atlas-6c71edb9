@@ -240,17 +240,20 @@ Popular methods you might want to route:
 
 ## Monitoring Method Routes
 
-Metrics track routing decisions:
+You can track routing behavior using the standard request metrics:
 
-```
-method_route_hits_total{method="getSlot",backend="mainnet-primary"} 1543
-load_balanced_requests_total{method="getBalance"} 892
+```promql
+# Requests to a specific method and backend
+rpc_requests_total{rpc_method="getSlot",backend="mainnet-primary"}
+
+# All requests to a method (across all backends)
+sum(rpc_requests_total{rpc_method="getSlot"}) by (backend)
 ```
 
 Query routing statistics:
 
 ```bash
-curl http://localhost:28901/metrics | grep method_route
+curl http://localhost:28901/metrics | grep rpc_requests_total
 ```
 
 ## Best Practices
